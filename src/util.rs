@@ -42,9 +42,47 @@ pub fn all_alpha_zero(px: &[u8]) -> bool {
     px.chunks_exact(4).all(|p| p[3] == 0)
 }
 
+/// Normalise 32-bit BGRA from a shell/GDI bitmap to premultiplied alpha:
+/// * no alpha channel at all (every alpha 0) -> fully opaque;
+/// * straight alpha (some colour channel exceeds its alpha) -> premultiply;
+/// * otherwise it is already premultiplied and left alone.
+pub fn normalize_to_premultiplied(px: &mut [u8]) {
+    if all_alpha_zero(px) {
+        for p in px.chunks_exact_mut(4) {
+            p[3] = 255;
+        }
+        return;
+    }
+    let straight = px.chunks_exact(4).any(|p| p[0] > p[3] || p[1] > p[3] || p[2] > p[3]);
+    if straight {
+        premultiply_bgra(px);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_opaque_when_no_alpha() {
+        let mut px = [10, 20, 30, 0, 1, 2, 3, 0];
+        normalize_to_premultiplied(&mut px);
+        assert_eq!(px, [10, 20, 30, 255, 1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn normalize_premultiplies_straight_alpha() {
+        let mut px = [200, 100, 50, 128, 0, 0, 0, 255];
+        normalize_to_premultiplied(&mut px);
+        assert_eq!(px, [100, 50, 25, 128, 0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn normalize_leaves_premultiplied_alone() {
+        let mut px = [100, 50, 25, 128];
+        normalize_to_premultiplied(&mut px);
+        assert_eq!(px, [100, 50, 25, 128]);
+    }
 
     #[test]
     fn next_minute_from_start_of_minute() {

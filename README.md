@@ -5,7 +5,7 @@ a floating dock and flyout panels, drawn with Direct2D + DirectComposition over
 the DWM backdrop. `explorer.exe` keeps running; nothing needs admin rights.
 See [PLAN.md](PLAN.md) for the full design.
 
-**Status: Milestone 2** (live active window + minute-boundary clock), on top of M1 (spike, scaffolding, recovery hotkey).
+**Status: Milestone 3** (dock shows running apps), on top of M2 (active window, clock) and M1 (spike, scaffolding, recovery hotkey).
 
 ## Requirements
 
@@ -113,6 +113,33 @@ Things to check:
 
 Packaged (Store) apps may show a generic icon until M3 adds shell icon lookup.
 
+## M3: running apps in the dock
+
+The dock shows a Start slot, a separator and one icon per running app. Windows
+are grouped by app: the AUMID for packaged/Store apps (and apps that set one,
+like browser profiles), otherwise the exe path. A window counts if it is
+visible, not cloaked (so other virtual desktops and suspended Store apps are
+left out), has a title, and is unowned or marked as an app window.
+
+* Tracking is event-driven: WinEvent hooks for show, hide, destroy and
+  cloak/uncloak. A full window scan runs only at startup, on resume, on a
+  display change and when Explorer restarts.
+* Icons are loaded by a background shell thread (`IShellItemImageFactory`),
+  at least 64 x 64 and larger at high DPI so the M4 hover zoom stays sharp.
+  They are kept as GPU bitmaps in an 8 MB LRU cache.
+* Indicators: a dot for a running app, two dots for several windows, an
+  accent pill under the focused app.
+* The dock window resizes as apps come and go; the reserved bottom band stays
+  fixed. Clicking icons arrives in M4.
+
+Things to check:
+
+1. Open and close apps: icons appear and disappear without delay.
+2. Open a second window of the same app: it shares one slot with two dots.
+3. Store apps (Calculator, Settings, Terminal) show their own icons.
+4. Move a window to another virtual desktop: its icon leaves the dock.
+5. Memory gate: idle Private Working Set ≤ 32 MB with your usual apps open.
+
 ## Files
 
 | Path | Contents |
@@ -133,6 +160,11 @@ Packaged (Store) apps may show a generic icon until M3 adds shell icon lookup.
 | `src/clock.rs` | minute-boundary clock (one-shot timer) |
 | `src/foreground.rs` | active window WinEvent hooks |
 | `src/icon.rs` | window icon -> BGRA pixels |
+| `src/apps.rs` | dock eligibility and app identity (AUMID / exe) |
+| `src/winevents.rs` | window lifecycle WinEvent hooks |
+| `src/assets.rs` | shell icon / name loader thread |
+| `src/dock_model.rs` | running-app grouping (unit-tested) |
+| `src/lru.rs` | byte-budgeted icon cache (unit-tested) |
 | `src/util.rs` | pure helpers with unit tests |
 | `src/main.rs` | the shell app |
 | `src/bin/spike.rs` | M1 spike |

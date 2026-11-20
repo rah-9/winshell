@@ -110,3 +110,39 @@ pub fn render(icon: HICON, size: u32) -> Option<Bgra> {
         out
     }
 }
+
+/// Copy a 32-bit HBITMAP (e.g. from IShellItemImageFactory) into premultiplied BGRA.
+/// The bitmap is not freed here.
+pub fn hbitmap_to_bgra(hbmp: HBITMAP) -> Option<Bgra> {
+    unsafe {
+        let mut bm = BITMAP::default();
+        if GetObjectW(hbmp.into(), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as _)) == 0 {
+            return None;
+        }
+        let (w, h) = (bm.bmWidth.max(0) as u32, bm.bmHeight.unsigned_abs());
+        if w == 0 || h == 0 || w > 1024 || h > 1024 {
+            return None;
+        }
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let hdc = CreateCompatibleDC(None);
+        let lines = GetDIBits(hdc, hbmp, 0, h, Some(px.as_mut_ptr() as _), &mut bmi, DIB_RGB_COLORS);
+        let _ = DeleteDC(hdc);
+        if lines != h as i32 {
+            return None;
+        }
+        crate::util::normalize_to_premultiplied(&mut px);
+        Some(Bgra { width: w, height: h, pixels: px })
+    }
+}

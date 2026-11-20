@@ -9,6 +9,12 @@
 //! clock that updates exactly on the minute boundary with a one-shot timer and
 //! stays correct across sleep/resume and manual time changes.
 //!
+//! M3: the dock lists running apps, one slot per app (AUMID or exe path),
+//! tracked by WinEvent hooks with full rescans only on startup, resume,
+//! display change and Explorer restart. Icons come from the shell on the asset
+//! thread and live in a bounded LRU of GPU bitmaps. Indicators: running dot,
+//! multi-window dots, focused accent pill.
+//!
 //! The native taskbar is not touched until M5.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -26,6 +32,7 @@ fn main() {
 #[cfg(windows)]
 mod app {
     use std::cell::{Cell, RefCell};
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicIsize, Ordering};
 
     use windows::Win32::Foundation::*;
@@ -33,19 +40,25 @@ mod app {
     use windows::Win32::Graphics::Direct2D::{ID2D1Bitmap1, ID2D1DeviceContext};
     use windows::Win32::Graphics::DirectWrite::*;
     use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
     use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::core::{PCWSTR, Result, w};
 
     use winshell::appbar::{self, AppBar, Edge, ReserveMode, WM_APPBAR_CALLBACK};
+    use winshell::apps;
+    use winshell::assets::{AssetLoader, AssetRequest, WM_SHELL_ASSET};
     use winshell::clock::{self, Clock};
+    use winshell::dock_model::DockModel;
     use winshell::dwm::{self, Backdrop, Corners, DwmStyle};
     use winshell::foreground::{self, ForegroundTracker, Kind, WM_SHELL_FOREGROUND, WM_SHELL_TITLE};
     use winshell::instance::SingleInstance;
+    use winshell::lru::Lru;
     use winshell::mem::MemSnapshot;
     use winshell::render::{self, Gfx, WindowSurface, rectf};
     use winshell::util::truncate_chars;
     use winshell::win::{self, MonitorGeometry, px};
+    use winshell::winevents::{WM_SHELL_WINDOWS, WindowEventHooks};
     use winshell::{hotkey, icon, log};
 
     const TOPBAR_CLASS: PCWSTR = w!("WinShellTheme_TopBarClass");
@@ -72,7 +85,21 @@ mod app {
     const DOCK_PAD_X: f32 = 10.0;
     const DOCK_SLOT: f32 = 48.0;
     const DOCK_SLOT_GAP: f32 = 4.0;
-    const PLACEHOLDER_SLOTS: usize = 5;
+    const DOCK_SLOT_RADIUS: f32 = 12.0;
+    const DOCK_SEPARATOR_HEIGHT: f32 = 32.0;
+    const DOCK_SEPARATOR_MARGIN: f32 = 6.0;
+    /// Drawn icon size inside the 48 px slot.
+    const DOCK_ICON: f32 = 44.0;
+    /// Hover magnification (M4). Icons are fetched big enough to scale up cleanly.
+    const DOCK_HOVER_SCALE: f32 = 1.15;
+    /// PLAN.md section 2: icons cached at 64 x 64 at least; larger at high DPI.
+    const DOCK_ICON_FETCH_MIN: u32 = 64;
+    const ICON_CACHE_BYTES: usize = 8 * 1024 * 1024;
+    const INDICATOR_GAP: f32 = 2.0;
+    const RUNNING_DOT: f32 = 4.0;
+    const MULTI_DOT: f32 = 3.0;
+    const FOCUS_PILL_W: f32 = 12.0;
+    const FOCUS_PILL_H: f32 = 4.0;
 
     // Theme tokens (PLAN.md section 3, dark). Themes become configurable in M8.
     const GLASS_BG: u32 = 0x14161CB7;
@@ -81,6 +108,9 @@ mod app {
     const TEXT_PRIMARY: u32 = 0xF2F4F8FF;
     const TEXT_SECONDARY: u32 = 0xA8AEBBFF;
     const TEXT_DISABLED: u32 = 0x6A7080FF;
+    const ACCENT: u32 = 0x6EA8FEFF;
+    const RUNNING_DOT_COLOR: u32 = 0xFFFFFF99;
+    const START_GLYPH_COLOR: u32 = 0xF2F4F8E6;
 
     /// Reservation HWNDs for the panic hook, which cannot borrow the app state.
     static TOP_RESERVE_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -165,6 +195,16 @@ mod app {
         active: Active,
         bar: BarLayout,
         first_tick_logged: bool,
+        // M3: running apps in the dock.
+        dock_model: DockModel,
+        window_hooks: WindowEventHooks,
+        assets: AssetLoader,
+        icons: Lru<ID2D1Bitmap1>,
+        icon_requested: HashSet<String>,
+        app_names: HashMap<String, String>,
+        /// Bottom reservation band and usable horizontal span, from `layout`.
+        bottom_band: RECT,
+        span: (i32, i32),
     }
 
     pub fn main() {
@@ -186,7 +226,7 @@ mod app {
             return;
         };
 
-        log!("winshell M2 starting (reserve={}, {:?})", opts.reserve.name(), opts.style);
+        log!("winshell M3 starting (reserve={}, {:?})", opts.reserve.name(), opts.style);
         if let Err(e) = run(opts) {
             log!("fatal: {e:?}");
             cleanup_raw();
@@ -231,6 +271,11 @@ mod app {
         match hotkey::register_emergency(top_hwnd) {
             Some(c) => log!("emergency hotkey: {c}"),
             None => log!("WARNING: emergency hotkey unavailable (Esc and F12 combinations both taken)"),
+        }
+
+        // UI thread is an STA (PLAN.md section 6); shell property stores need COM.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         }
 
         let gfx = Gfx::new()?;
@@ -281,7 +326,16 @@ mod app {
             active: Active { hwnd: HWND::default(), kind: Kind::Desktop, title: "Desktop".into(), icon: None },
             bar: BarLayout::default(),
             first_tick_logged: false,
+            dock_model: DockModel::default(),
+            window_hooks: WindowEventHooks::install(top_hwnd),
+            assets: AssetLoader::start(top_hwnd),
+            icons: Lru::new(ICON_CACHE_BYTES),
+            icon_requested: HashSet::new(),
+            app_names: HashMap::new(),
+            bottom_band: zero,
+            span: (0, 1),
         };
+        app.rescan("startup");
         app.layout();
         app.opts.reserve.finish(top_res_hwnd);
         app.opts.reserve.finish(bot_res_hwnd);
@@ -316,6 +370,20 @@ mod app {
         })
     }
 
+    /// Start button glyph: a 2 x 2 grid of rounded squares, centred in the slot.
+    fn paint_start_glyph(dc: &ID2D1DeviceContext, slot: D2D_RECT_F, s: f32) -> Result<()> {
+        let cell = (8.0 * s).round();
+        let gap = (2.0 * s).round().max(1.0);
+        let total = 2.0 * cell + gap;
+        let x0 = (slot.left + (slot.right - slot.left - total) / 2.0).round();
+        let y0 = (slot.top + (slot.bottom - slot.top - total) / 2.0).round();
+        for (cx, cy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+            let r = rectf(x0 + cx * (cell + gap), y0 + cy * (cell + gap), cell, cell);
+            render::fill_round(dc, r, 1.5 * s, START_GLYPH_COLOR)?;
+        }
+        Ok(())
+    }
+
     fn rect_to_pixels(r: D2D_RECT_F) -> RECT {
         RECT {
             left: r.left.floor() as i32 - 1,
@@ -346,6 +414,9 @@ mod app {
                 }
                 // Icon pixels are rendered at the exact device size; redo them for the new scale.
                 self.active.icon = self.load_icon(self.active.hwnd, self.active.kind);
+                self.icons.clear();
+                self.icon_requested.clear();
+                self.sync_assets();
             }
 
             let top = self.top_reserve.set_pos(self.monitor.monitor, px(TOP_RESERVE, s));
@@ -359,15 +430,9 @@ mod app {
 
             let bar = win::rect(left + m, top.top + m, (right - left - 2 * m).max(1), px(BAR_HEIGHT, s));
 
-            let n = PLACEHOLDER_SLOTS as f32;
-            let dock_w = px(2.0 * DOCK_PAD_X + n * DOCK_SLOT + (n - 1.0) * DOCK_SLOT_GAP, s);
-            let dock_h = px(DOCK_HEIGHT, s);
-            let dock = win::rect(
-                left + (right - left - dock_w) / 2,
-                bottom.bottom - px(DOCK_MARGIN_BOTTOM, s) - dock_h,
-                dock_w,
-                dock_h,
-            );
+            self.bottom_band = bottom;
+            self.span = (left, right);
+            let dock = self.dock_rect();
 
             log!(
                 "layout: dpi {} top reserve {} bottom reserve {} bar {} dock {}",
@@ -431,8 +496,173 @@ mod app {
 
         fn on_foreground(&mut self) {
             self.tracker.ack_foreground();
-            if self.update_active(unsafe { GetForegroundWindow() }) {
+            let fg = unsafe { GetForegroundWindow() };
+            if self.update_active(fg) {
                 self.redraw_bar(None);
+            }
+            // A window can become dock-eligible late (e.g. it gets its title after showing).
+            let root = apps::root_owner(fg);
+            let mut changed = match apps::window_entry(root) {
+                Some(e) => self.dock_model.upsert(e),
+                None => false,
+            };
+            changed |= self.dock_model.set_focused(root.0 as isize);
+            if changed {
+                self.dock_changed();
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Dock: running apps
+        // ------------------------------------------------------------------
+
+        /// Full window rescan. Only on startup, resume, display change and Explorer restart.
+        fn rescan(&mut self, why: &str) {
+            self.dock_model.replace_all(apps::enumerate());
+            let fg = apps::root_owner(unsafe { GetForegroundWindow() });
+            self.dock_model.set_focused(fg.0 as isize);
+            let windows: usize = self.dock_model.groups().iter().map(|g| g.windows.len()).sum();
+            log!("window rescan ({why}): {} apps, {windows} windows", self.dock_model.groups().len());
+            self.sync_assets();
+        }
+
+        /// Queued window events: re-evaluate only the windows that changed.
+        fn on_window_events(&mut self) {
+            let mut changed = false;
+            for p in self.window_hooks.take_pending() {
+                if p.destroyed {
+                    changed |= self.dock_model.remove(p.hwnd);
+                    continue;
+                }
+                match apps::window_entry(HWND(p.hwnd as _)) {
+                    Some(e) => changed |= self.dock_model.upsert(e),
+                    None => changed |= self.dock_model.remove(p.hwnd),
+                }
+            }
+            let fg = apps::root_owner(unsafe { GetForegroundWindow() });
+            changed |= self.dock_model.set_focused(fg.0 as isize);
+            if changed {
+                self.dock_changed();
+            }
+        }
+
+        fn dock_changed(&mut self) {
+            self.sync_assets();
+            self.relayout_dock();
+            self.redraw_dock();
+        }
+
+        fn icon_fetch_size(&self) -> u32 {
+            let want = (DOCK_ICON * self.monitor.scale() * DOCK_HOVER_SCALE).ceil() as u32;
+            want.max(DOCK_ICON_FETCH_MIN)
+        }
+
+        /// Fill in known names and ask the asset thread for icons not yet cached.
+        fn sync_assets(&mut self) {
+            let size = self.icon_fetch_size();
+            let mut wanted = Vec::new();
+            for g in self.dock_model.groups() {
+                if !self.icons.contains(&g.id) && !self.icon_requested.contains(&g.id) {
+                    wanted.push(AssetRequest {
+                        app_id: g.id.clone(),
+                        aumid: g.aumid.clone(),
+                        exe_path: g.exe_path.clone(),
+                        size,
+                    });
+                }
+            }
+            for r in wanted {
+                self.icon_requested.insert(r.app_id.clone());
+                self.assets.request(r);
+            }
+            let unnamed: Vec<String> =
+                self.dock_model.groups().iter().filter(|g| g.display_name.is_empty()).map(|g| g.id.clone()).collect();
+            for id in unnamed {
+                if let Some(n) = self.app_names.get(&id).cloned()
+                    && let Some(g) = self.dock_model.group_mut(&id)
+                {
+                    g.display_name = n;
+                }
+            }
+        }
+
+        fn on_assets(&mut self) {
+            let mut redraw = false;
+            for r in self.assets.drain() {
+                self.icon_requested.remove(&r.app_id);
+                if !r.display_name.is_empty() {
+                    self.app_names.insert(r.app_id.clone(), r.display_name.clone());
+                    if let Some(g) = self.dock_model.group_mut(&r.app_id) {
+                        g.display_name = r.display_name.clone();
+                    }
+                }
+                let bitmap = r.icon.and_then(|i| {
+                    let bytes = (i.width * i.height * 4) as usize;
+                    self.gfx.bitmap_from_bgra(i.width, i.height, &i.pixels).ok().map(|b| (b, bytes))
+                });
+                match bitmap {
+                    // The raw pixels are dropped here; only the GPU bitmap is kept.
+                    Some((bmp, bytes)) => {
+                        for evicted in self.icons.insert(r.app_id.clone(), bmp, bytes) {
+                            log!("icon cache evicted {evicted}");
+                        }
+                    }
+                    None => log!("no icon for {}", r.app_id),
+                }
+                redraw |= self.dock_model.groups().iter().any(|g| g.id == r.app_id);
+            }
+            if redraw {
+                self.redraw_dock();
+            }
+        }
+
+        /// How many running apps fit beside the Start slot within the usable span.
+        fn visible_app_count(&self) -> usize {
+            let s = self.monitor.scale();
+            let avail = (self.span.1 - self.span.0 - 2 * px(BAR_MARGIN, s)) as f32;
+            let n = self.dock_model.groups().len();
+            (0..=n).rev().find(|&k| self.dock_width(k) <= avail).unwrap_or(0)
+        }
+
+        fn dock_width(&self, apps: usize) -> f32 {
+            let s = self.monitor.scale();
+            let mut w = 2.0 * DOCK_PAD_X * s + DOCK_SLOT * s; // padding + Start
+            if apps > 0 {
+                w += 2.0 * DOCK_SEPARATOR_MARGIN * s + 1.0;
+                w += apps as f32 * DOCK_SLOT * s + (apps - 1) as f32 * DOCK_SLOT_GAP * s;
+            }
+            w.ceil()
+        }
+
+        fn dock_rect(&self) -> RECT {
+            let s = self.monitor.scale();
+            let (left, right) = self.span;
+            let dock_w = self.dock_width(self.visible_app_count()) as i32;
+            let dock_h = px(DOCK_HEIGHT, s);
+            win::rect(
+                left + (right - left - dock_w) / 2,
+                self.bottom_band.bottom - px(DOCK_MARGIN_BOTTOM, s) - dock_h,
+                dock_w,
+                dock_h,
+            )
+        }
+
+        /// The dock window resizes as apps come and go; the reservation never does.
+        fn relayout_dock(&mut self) {
+            let r = self.dock_rect();
+            if r == self.dock.rect {
+                return;
+            }
+            self.dock.rect = r;
+            win::move_window(self.dock.hwnd, r, true);
+            if let Err(e) = self.dock.surface.resize(&self.gfx, (r.right - r.left) as u32, (r.bottom - r.top) as u32) {
+                log!("dock surface resize failed: {e:?}");
+            }
+        }
+
+        fn redraw_dock(&mut self) {
+            if let Err(e) = self.draw_dock().and_then(|_| self.gfx.commit()) {
+                self.on_draw_error(e);
             }
         }
 
@@ -527,9 +757,7 @@ mod app {
 
         fn redraw_all(&mut self) {
             self.redraw_bar(None);
-            if let Err(e) = self.draw_dock().and_then(|_| self.gfx.commit()) {
-                self.on_draw_error(e);
-            }
+            self.redraw_dock();
         }
 
         /// Redraw the top bar (`dirty` = surface pixels, `None` = everything) and commit.
@@ -578,19 +806,63 @@ mod app {
             Ok(())
         }
 
-        fn draw_dock(&self) -> Result<()> {
+        fn draw_dock(&mut self) -> Result<()> {
             let s = self.monitor.scale();
-            let radius = self.opts.style.corners.approx_radius() * s;
-            let (dw, dh) = (self.dock.surface.width as f32, self.dock.surface.height as f32);
-            self.dock.surface.draw(|dc| {
+            let n = self.visible_app_count();
+            // Look icons up first (the LRU touch needs &mut); COM pointers are cheap to clone.
+            let ids: Vec<String> = self.dock_model.groups().iter().take(n).map(|g| g.id.clone()).collect();
+            let bitmaps: Vec<Option<ID2D1Bitmap1>> = ids.iter().map(|id| self.icons.get(id).cloned()).collect();
+            let this = &*self;
+            let radius = this.opts.style.corners.approx_radius() * s;
+            let (dw, dh) = (this.dock.surface.width as f32, this.dock.surface.height as f32);
+            let focused = this.dock_model.focused();
+            this.dock.surface.draw(|dc| {
                 let full = rectf(0.0, 0.0, dw, dh);
                 render::fill_round(dc, full, radius, GLASS_BG)?;
                 render::stroke_round(dc, full, radius, BORDER)?;
+
                 let slot = DOCK_SLOT * s;
-                let y = (dh - slot) / 2.0;
-                for i in 0..PLACEHOLDER_SLOTS {
-                    let x = DOCK_PAD_X * s + i as f32 * (slot + DOCK_SLOT_GAP * s);
-                    render::fill_round(dc, rectf(x, y, slot, slot), 12.0 * s, PILL_BG)?;
+                let y = ((dh - slot) / 2.0).round();
+                let mut x = DOCK_PAD_X * s;
+
+                // Start button (opens the native Start menu from M4).
+                paint_start_glyph(dc, rectf(x, y, slot, slot), s)?;
+                x += slot;
+
+                if n > 0 {
+                    x += DOCK_SEPARATOR_MARGIN * s;
+                    let sep_h = DOCK_SEPARATOR_HEIGHT * s;
+                    render::fill_round(dc, rectf(x.round(), ((dh - sep_h) / 2.0).round(), 1.0, sep_h), 0.0, BORDER)?;
+                    x += 1.0 + DOCK_SEPARATOR_MARGIN * s;
+                }
+
+                for (i, g) in this.dock_model.groups().iter().take(n).enumerate() {
+                    let sx = x.round();
+                    let icon_sz = (DOCK_ICON * s).round();
+                    let inset = ((slot - icon_sz) / 2.0).round();
+                    let dest = rectf(sx + inset, y + inset, icon_sz, icon_sz);
+                    match &bitmaps[i] {
+                        Some(bmp) => render::draw_bitmap(dc, bmp, dest)?,
+                        None => render::fill_round(dc, dest, DOCK_SLOT_RADIUS * s, PILL_BG)?,
+                    }
+
+                    // Below the slot: focused pill, else multi-window dots, else running dot.
+                    let iy = y + slot + INDICATOR_GAP * s;
+                    let cx = sx + slot / 2.0;
+                    if focused == Some(i) {
+                        let (w, h) = (FOCUS_PILL_W * s, FOCUS_PILL_H * s);
+                        render::fill_round(dc, rectf(cx - w / 2.0, iy, w, h), h / 2.0, ACCENT)?;
+                    } else if g.windows.len() > 1 {
+                        let d = MULTI_DOT * s;
+                        let gap = INDICATOR_GAP * s;
+                        let x0 = cx - d - gap / 2.0;
+                        render::fill_round(dc, rectf(x0, iy, d, d), d / 2.0, RUNNING_DOT_COLOR)?;
+                        render::fill_round(dc, rectf(x0 + d + gap, iy, d, d), d / 2.0, RUNNING_DOT_COLOR)?;
+                    } else {
+                        let d = RUNNING_DOT * s;
+                        render::fill_round(dc, rectf(cx - d / 2.0, iy, d, d), d / 2.0, RUNNING_DOT_COLOR)?;
+                    }
+                    x += slot + DOCK_SLOT_GAP * s;
                 }
                 Ok(())
             })
@@ -617,6 +889,10 @@ mod app {
                 self.gfx = gfx;
                 self.fonts = fonts;
                 self.active.icon = self.load_icon(self.active.hwnd, self.active.kind);
+                // Dock bitmaps belonged to the old device: drop them and fetch again.
+                self.icons.clear();
+                self.icon_requested.clear();
+                self.sync_assets();
                 self.bar = self.compute_bar_layout();
                 self.top_bar.surface.draw(|dc| self.paint_bar(dc))?;
                 self.draw_dock()?;
@@ -668,6 +944,7 @@ mod app {
             self.bottom_reserve.registered = false;
             self.top_reserve.register();
             self.bottom_reserve.register();
+            self.rescan("Explorer restart");
             self.layout();
             self.redraw_all();
         }
@@ -677,11 +954,16 @@ mod app {
             self.resync_clock("resume");
             self.update_active(unsafe { GetForegroundWindow() });
             self.redraw_bar(None);
+            self.rescan("resume");
+            self.relayout_dock();
+            self.redraw_dock();
         }
 
         fn shutdown(&mut self) {
             log!("clean exit; {}", MemSnapshot::now().describe());
             self.tracker.uninstall();
+            self.window_hooks.uninstall();
+            self.assets.shutdown();
             self.clock.disarm();
             self.top_reserve.remove();
             self.bottom_reserve.remove();
@@ -775,6 +1057,14 @@ mod app {
                 with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_title());
                 LRESULT(0)
             }
+            WM_SHELL_WINDOWS => {
+                with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_window_events());
+                LRESULT(0)
+            }
+            WM_SHELL_ASSET => {
+                with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_assets());
+                LRESULT(0)
+            }
             WM_TIMECHANGE => {
                 with_app_on_bar(hwnd, msg, wp, lp, |a| a.resync_clock("WM_TIMECHANGE"));
                 LRESULT(0)
@@ -818,6 +1108,9 @@ mod app {
             }
             WM_DPICHANGED | WM_DISPLAYCHANGE => {
                 with_app_on_bar(hwnd, msg, wp, lp, |a| {
+                    if msg == WM_DISPLAYCHANGE {
+                        a.rescan("display change");
+                    }
                     a.layout();
                     a.redraw_all();
                 });
