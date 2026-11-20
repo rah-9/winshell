@@ -1,0 +1,57 @@
+[package]
+name = "winshell"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight Windows 11 desktop shell overlay (top bar + dock)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "winshell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "winshell"
+path = "src/main.rs"
+
+[[bin]]
+name = "spike"
+path = "src/bin/spike.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-numerics = "0.3"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false
+overflow-checks = false
