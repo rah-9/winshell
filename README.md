@@ -5,7 +5,7 @@ a floating dock and flyout panels, drawn with Direct2D + DirectComposition over
 the DWM backdrop. `explorer.exe` keeps running; nothing needs admin rights.
 See [PLAN.md](PLAN.md) for the full design.
 
-**Status: Milestone 1** (spike + window scaffolding + recovery hotkey).
+**Status: Milestone 2** (live active window + minute-boundary clock), on top of M1 (spike, scaffolding, recovery hotkey).
 
 ## Requirements
 
@@ -86,6 +86,33 @@ at the bottom (maximised windows stop at both), lays out around the native
 taskbar edge, hides on fullscreen apps and re-registers after an Explorer
 restart. Exit with the emergency hotkey.
 
+## M2: active window and clock
+
+The top bar's left zone shows your user handle and the active window's icon
+and title (truncated at 40 characters). It follows focus changes and title
+changes (e.g. browser tabs) through WinEvent hooks; the title hook is scoped to
+the foreground app's process. Clicking the taskbar or the bar itself keeps
+the previous app shown; the desktop shows "Desktop".
+
+The right zone shows the clock ("Fri 20 Nov, 02:06 PM", day and month names in
+your locale). It redraws only the clock pill, once per minute, from a one-shot
+timer re-armed for the next boundary. It re-syncs after sleep/resume, a manual
+time or time-zone change, and a regional-format change.
+
+Things to check:
+
+1. Switch between apps and browser tabs: icon and title follow immediately.
+2. Watch the clock turn over: it changes within a few ms of the minute.
+3. Change the time or time zone in Settings, then sleep and wake the PC:
+   the clock is correct straight away.
+4. Memory gate: idle Private Working Set ≤ 30 MB (Task Manager, Details tab,
+   "Memory (private working set)" column). The log also records it at
+   startup and at the first minute tick.
+5. Idle CPU: 0 % between minute ticks (Process Explorer shows no context
+   switches apart from the tick and real focus/title changes).
+
+Packaged (Store) apps may show a generic icon until M3 adds shell icon lookup.
+
 ## Files
 
 | Path | Contents |
@@ -103,5 +130,9 @@ restart. Exit with the emergency hotkey.
 | `src/appbar.rs` | reservation AppBars, native taskbar edge |
 | `src/hotkey.rs` | emergency hotkey |
 | `src/mem.rs` | Private Working Set measurement |
-| `src/main.rs` | M1 scaffold app |
+| `src/clock.rs` | minute-boundary clock (one-shot timer) |
+| `src/foreground.rs` | active window WinEvent hooks |
+| `src/icon.rs` | window icon -> BGRA pixels |
+| `src/util.rs` | pure helpers with unit tests |
+| `src/main.rs` | the shell app |
 | `src/bin/spike.rs` | M1 spike |

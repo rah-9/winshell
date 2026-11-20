@@ -5,7 +5,7 @@
 //! process. Each window gets its own composition target + root visual +
 //! surface. Drawing happens only when the caller asks (no render loop).
 
-use windows::Win32::Foundation::{HMODULE, HWND, POINT};
+use windows::Win32::Foundation::{HMODULE, HWND, POINT, RECT};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -23,6 +23,9 @@ pub struct Gfx {
     pub d2d_device: ID2D1Device,
     pub dcomp: IDCompositionDevice,
     pub dwrite: IDWriteFactory,
+    /// Device context used only to create device-dependent resources (bitmaps)
+    /// outside a BeginDraw; resources are shared by every context of `d2d_device`.
+    pub resource_dc: ID2D1DeviceContext,
     pub driver: &'static str,
 }
 
@@ -39,7 +42,8 @@ impl Gfx {
             let d2d_device = d2d_factory.CreateDevice(&dxgi)?;
             let dcomp: IDCompositionDevice = DCompositionCreateDevice2(&d2d_device)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            Ok(Self { d3d, d2d_factory, d2d_device, dcomp, dwrite, driver })
+            let resource_dc = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+            Ok(Self { d3d, d2d_factory, d2d_device, dcomp, dwrite, resource_dc, driver })
         }
     }
 
@@ -50,6 +54,58 @@ impl Gfx {
 
     pub fn commit(&self) -> Result<()> {
         unsafe { self.dcomp.Commit() }
+    }
+
+    /// Premultiplied BGRA pixels -> D2D bitmap on the shared device.
+    pub fn bitmap_from_bgra(&self, width: u32, height: u32, pixels: &[u8]) -> Result<ID2D1Bitmap1> {
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+            colorContext: std::mem::ManuallyDrop::new(None),
+        };
+        unsafe {
+            self.resource_dc.CreateBitmap(
+                D2D_SIZE_U { width, height },
+                Some(pixels.as_ptr() as *const _),
+                width * 4,
+                &props,
+            )
+        }
+    }
+
+    /// Width in DIPs (device pixels here, DPI is fixed at 96) of `s` laid out on one line.
+    pub fn measure(&self, s: &str, fmt: &IDWriteTextFormat) -> f32 {
+        let w: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            let Ok(layout) = self.dwrite.CreateTextLayout(&w, fmt, 100_000.0, 1_000.0) else { return 0.0 };
+            let mut m = DWRITE_TEXT_METRICS::default();
+            if layout.GetMetrics(&mut m).is_err() {
+                return 0.0;
+            }
+            m.widthIncludingTrailingWhitespace
+        }
+    }
+
+    /// Text format that trims overflow with "…" instead of clipping mid-glyph.
+    pub fn text_format_ellipsis(
+        &self,
+        family: PCWSTR,
+        size: f32,
+        weight: DWRITE_FONT_WEIGHT,
+    ) -> Result<IDWriteTextFormat> {
+        let f = self.text_format(family, size, weight)?;
+        unsafe {
+            let sign = self.dwrite.CreateEllipsisTrimmingSign(&f)?;
+            let trimming =
+                DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
+            f.SetTrimming(&trimming, &sign)?;
+        }
+        Ok(f)
     }
 
     pub fn text_format(&self, family: PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
@@ -127,14 +183,38 @@ impl WindowSurface {
     /// Redraw the whole surface. The closure draws in surface pixel coordinates
     /// starting at (0, 0); the update offset DComp hands back is applied for it.
     pub fn draw(&self, f: impl FnOnce(&ID2D1DeviceContext) -> Result<()>) -> Result<()> {
+        self.draw_region(None, f)
+    }
+
+    /// Redraw only `dirty` (surface pixel coordinates; `None` = whole surface).
+    /// The closure still draws in whole-surface coordinates; output is clipped
+    /// to `dirty`, and pixels outside it keep their previous content.
+    pub fn draw_region(&self, dirty: Option<RECT>, f: impl FnOnce(&ID2D1DeviceContext) -> Result<()>) -> Result<()> {
         let Some(surface) = &self.surface else { return Ok(()) };
+        let full = RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 };
+        let r = match dirty {
+            Some(d) => RECT {
+                left: d.left.max(0),
+                top: d.top.max(0),
+                right: d.right.min(full.right),
+                bottom: d.bottom.min(full.bottom),
+            },
+            None => full,
+        };
+        if r.right <= r.left || r.bottom <= r.top {
+            return Ok(());
+        }
         unsafe {
             let mut offset = POINT::default();
-            let dc: ID2D1DeviceContext = surface.BeginDraw(None, &mut offset)?;
+            let dc: ID2D1DeviceContext = surface.BeginDraw(dirty.map(|_| &r as *const RECT), &mut offset)?;
             dc.SetDpi(96.0, 96.0);
-            dc.SetTransform(&Matrix3x2::translation(offset.x as f32, offset.y as f32));
+            dc.SetTransform(&Matrix3x2::translation((offset.x - r.left) as f32, (offset.y - r.top) as f32));
+            let clip =
+                D2D_RECT_F { left: r.left as f32, top: r.top as f32, right: r.right as f32, bottom: r.bottom as f32 };
+            dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
             dc.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
             let drawn = f(&dc);
+            dc.PopAxisAlignedClip();
             let ended = surface.EndDraw();
             drawn?;
             ended
@@ -193,5 +273,10 @@ pub fn text(dc: &ID2D1DeviceContext, s: &str, fmt: &IDWriteTextFormat, r: D2D_RE
     unsafe {
         dc.DrawText(&w, fmt, &r, &b, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
     }
+    Ok(())
+}
+
+pub fn draw_bitmap(dc: &ID2D1DeviceContext, bmp: &ID2D1Bitmap1, dest: D2D_RECT_F) -> Result<()> {
+    unsafe { dc.DrawBitmap(bmp, Some(&dest), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None) };
     Ok(())
 }
