@@ -346,7 +346,11 @@ impl Worker {
         let Ok(selector) = BluetoothDevice::GetDeviceSelectorFromPairingState(true) else { return Vec::new() };
         let Ok(found) = DeviceInformation::FindAllAsyncAqsFilter(&selector).and_then(wait) else { return Vec::new() };
         let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         for info in found.into_iter().take(16) {
+            if std::time::Instant::now() > deadline {
+                break;
+            }
             let name = info.Name().map(|h| h.to_string()).unwrap_or_default();
             let connected = info
                 .Id()

@@ -769,7 +769,12 @@ impl App {
                 self.redraw_all();
             }
             // Both reservations get this; only act on the top one to avoid doing it twice.
-            ABN_FULLSCREENAPP if from == self.primary_reserve() => self.set_fullscreen(lp.0 != 0),
+            ABN_FULLSCREENAPP
+                if from == self.primary_reserve()
+                    && (self.top_reserve.registered || self.bottom_reserve.registered) =>
+            {
+                self.set_fullscreen(lp.0 != 0)
+            }
             _ => {}
         }
     }

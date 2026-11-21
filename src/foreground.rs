@@ -232,7 +232,7 @@ pub fn classify(hwnd: HWND) -> Kind {
 
 /// Start, Search, the notification centre, the touch keyboard and similar shell
 /// surfaces are separate processes; the bar must not show them as "apps".
-fn is_shell_host(pid: u32) -> bool {
+fn is_shell_host_uncached(pid: u32) -> bool {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -259,8 +259,35 @@ fn is_shell_host(pid: u32) -> bool {
         }
         let path = String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase();
         let name = path.rsplit('\\').next().unwrap_or("");
-        HOSTS.contains(&name)
+        // Only the real system copies: an exe merely *named* searchhost.exe elsewhere
+        // must not be able to hide its windows from the dock (review finding).
+        let windir = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()).to_ascii_lowercase();
+        let in_windows = [format!("{windir}\\systemapps\\"), format!("{windir}\\system32\\")]
+            .iter()
+            .any(|prefix| path.starts_with(prefix.as_str()));
+        in_windows && HOSTS.contains(&name)
     }
+}
+
+thread_local! {
+    /// pid -> is shell host. Small and cleared when full (pids are reused rarely).
+    static HOST_CACHE: std::cell::RefCell<std::collections::HashMap<u32, bool>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Cached `is_shell_host_uncached` (the move hook can re-check often).
+fn is_shell_host(pid: u32) -> bool {
+    if let Some(v) = HOST_CACHE.with(|c| c.borrow().get(&pid).copied()) {
+        return v;
+    }
+    let v = is_shell_host_uncached(pid);
+    HOST_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 64 {
+            c.clear();
+        }
+        c.insert(pid, v);
+    });
+    v
 }
 
 pub fn class_name(hwnd: HWND) -> String {

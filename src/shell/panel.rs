@@ -251,7 +251,15 @@ impl App {
         if kind == PanelKind::Bluetooth {
             self.sysmon.refresh_bt_devices();
         }
-        log!("flyout: open {kind:?}");
+        let name = match &kind {
+            PanelKind::Sound => "sound",
+            PanelKind::Battery => "battery",
+            PanelKind::Calendar => "calendar",
+            PanelKind::Wifi => "wifi",
+            PanelKind::Bluetooth => "bluetooth",
+            PanelKind::WindowList(_) => "window list",
+        };
+        log!("flyout: open {name}");
         let (y, m, _) = clock::today();
         let was_open = self.panel.is_some();
         self.panel = Some(PanelState {
@@ -278,6 +286,23 @@ impl App {
             self.network.set_scan_wanted(false);
         }
         self.flyout.hide();
+        // A bar/dock revealed from the edge must not stay up forever after the flyout.
+        if self.reveal_bar || self.reveal_dock {
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                    Some(self.top_bar.hwnd),
+                    super::TIMER_AUTOHIDE_BAR,
+                    500,
+                    None,
+                );
+                windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                    Some(self.top_bar.hwnd),
+                    super::TIMER_AUTOHIDE_DOCK,
+                    500,
+                    None,
+                );
+            }
+        }
         self.update_visibility();
     }
 

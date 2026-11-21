@@ -115,6 +115,10 @@ impl App {
                 bar.remove();
             }
         }
+        // Without a registered AppBar, ABN_FULLSCREENAPP(false) can never arrive.
+        if !self.top_reserve.registered && !self.bottom_reserve.registered {
+            self.fullscreen = false;
+        }
         let any = self.autohide_bar() || self.autohide_dock();
         if self.tracker.track_moves != any {
             self.tracker.track_moves = any;
@@ -129,7 +133,9 @@ impl App {
     pub fn place_edges(&mut self) {
         let (left, right) = self.span;
         let m = self.monitor.monitor;
-        win::move_window(self.edges.top, win::rect(left, m.top, right - left, 1), true);
+        // Leave the top-right corner free: a maximised window's close button lives there.
+        let corner = win::px(160.0, self.scale());
+        win::move_window(self.edges.top, win::rect(left, m.top, (right - left - corner).max(1), 1), true);
         win::move_window(self.edges.bottom, win::rect(left, m.bottom - 1, right - left, 1), true);
     }
 
@@ -142,6 +148,11 @@ impl App {
         let root = apps::root_owner(fg);
         unsafe {
             if IsIconic(root).as_bool() || !IsWindowVisible(root).as_bool() {
+                return (false, false);
+            }
+            // Bar and dock live on the primary monitor: apps on other screens don't count.
+            use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+            if MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST) != self.monitor.handle {
                 return (false, false);
             }
         }
@@ -158,7 +169,10 @@ impl App {
         let panel_open = self.panel.is_some();
         let (bar_covered, fs_a) = self.foreground_covers(&self.top_bar.rect);
         let (dock_covered, fs_b) = self.foreground_covers(&self.dock.rect);
-        let fullscreen = self.fullscreen || fs_a || fs_b;
+        // Detected full screen (from the window itself) disables the edge strips; the
+        // AppBar flag only hides, it never removes the way back (review: stuck hidden).
+        let detected_fs = fs_a || fs_b;
+        let fullscreen = self.fullscreen || detected_fs;
 
         let hide_bar = fullscreen || (self.autohide_bar() && bar_covered && !self.reveal_bar && !panel_open);
         let hide_dock = fullscreen || (self.autohide_dock() && dock_covered && !self.reveal_dock && !panel_open);
@@ -176,8 +190,8 @@ impl App {
         }
         // Edge strips only when something is auto-hidden, and never over a
         // full-screen app (games, video): there the edges do nothing.
-        self.edges.set(true, hide_bar && self.autohide_bar() && !fullscreen);
-        self.edges.set(false, hide_dock && self.autohide_dock() && !fullscreen);
+        self.edges.set(true, hide_bar && !detected_fs);
+        self.edges.set(false, hide_dock && !detected_fs);
     }
 
     /// The mouse touched a screen edge strip.
