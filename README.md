@@ -5,7 +5,7 @@ a floating dock and flyout panels, drawn with Direct2D + DirectComposition over
 the DWM backdrop. `explorer.exe` keeps running; nothing needs admin rights.
 See [PLAN.md](PLAN.md) for the full design.
 
-**Status: Milestones 1–7 built** (M8 themes / live reload and M9 packaging remain). Nothing has been run on Windows yet; see the checks under each milestone.
+**Status: Milestones 1–9 built.** Not yet run on Windows; see the checks under each milestone.
 
 ## Requirements
 
@@ -146,11 +146,13 @@ Things to check:
 ## Configuration
 
 `%APPDATA%\WinShellTheme\config.toml` is created on first run (schema from
-PLAN.md section 11). Changes apply on restart until M8 adds live reload.
+PLAN.md section 11). Saved changes apply live (M8).
 
 ```toml
 [general]
 user_handle = ""                 # empty = "@" + your Windows user name
+theme = "dark_glass"             # dark_glass, light_clean, a file in themes\ (no .toml), or auto_system
+follow_windows_theme = false     # true = follow Windows light/dark mode
 
 [top_bar]
 enabled_pills = ["bluetooth", "wifi", "volume", "battery", "clock", "notifications", "quick_settings"]
@@ -226,6 +228,50 @@ click elsewhere or press Esc.
 * **Dock mini player:** album art, title, artist and play/pause for the
   current media session; click it for the Sound flyout.
 
+## M8: themes and live reload
+
+* `themes\dark_glass.toml` and `themes\light_clean.toml` are written next to
+  `config.toml` on first run (never overwritten afterwards). Copy one to make
+  your own and set `theme = "<file name without .toml>"`. Theme names may only
+  contain letters, digits, `_` and `-`.
+* Colours are `#RRGGBB` or `#RRGGBBAA`; geometry (`window_corners`,
+  `pill_corner_radius`, `icon_slot_radius`) and `motion.duration_ms` are honoured.
+  Bad values are logged and the rest of the theme still applies.
+* `theme = "auto_system"` (or `follow_windows_theme = true`) switches between
+  Dark Glass and Light Clean when Windows changes light/dark mode.
+* Live reload: a watcher thread blocks in `ReadDirectoryChangesW` (no polling)
+  and reloads when `config.toml` or a theme file is saved. A file with a
+  syntax error is ignored (the log says why) and the previous settings stay.
+  The shell's own pin/unpin writes are recognised and not reloaded twice.
+
+## M9: packaging and hardening
+
+`winshell.exe` embeds its icon, version info and manifest (`asInvoker`: it never
+asks for admin rights; Per-Monitor-V2 DPI; UTF-8). At startup it restricts DLL
+loading to System32, removes the current folder from the DLL search path,
+refuses DLLs from network paths and low-integrity files, and disables legacy
+injection points (AppInit DLLs etc.). MSVC builds also get Control Flow Guard
+and `/DEPENDENTLOADFLAG:0x800`. Single `.exe`, no runtime DLLs to install.
+
+```text
+winshell.exe --quit               ask the running shell to exit cleanly
+winshell.exe --restore-taskbar    put the taskbar back from a leftover state file
+winshell.exe --enable-autostart   start with Windows (HKCU Run value)
+winshell.exe --disable-autostart
+winshell.exe --help
+```
+
+Starting it a second time just shows the running copy.
+
+Install for the current user (no admin): put `install.ps1` next to `winshell.exe`
+and run it. It copies the exe to `%LOCALAPPDATA%\Programs\WinShellTheme`,
+registers autostart and starts it (`-NoAutostart`, `-NoStart` to skip).
+`uninstall.ps1` exits the shell cleanly, restores the taskbar, removes
+autostart and the program folder (`-RemoveSettings` also deletes settings).
+
+Supply chain: `Cargo.lock` is committed; `deny.toml` bans network crates and
+unknown sources (`cargo deny check`); run `cargo audit` before releases.
+
 ## Files
 
 | Path | Contents |
@@ -234,6 +280,7 @@ click elsewhere or press Esc.
 | `%APPDATA%\WinShellTheme\spike.log` | spike log |
 | `%APPDATA%\WinShellTheme\crash.log` | panic log |
 | `%APPDATA%\WinShellTheme\config.toml` | settings and pinned apps |
+| `%APPDATA%\WinShellTheme\themes\*.toml` | themes |
 | `%APPDATA%\WinShellTheme\taskbar_state.toml` | original taskbar state (only while running or after a crash) |
 
 ## Source layout
@@ -262,5 +309,9 @@ click elsewhere or press Esc.
 | `src/power.rs` | battery status and notifications |
 | `src/sysmon.rs` | system monitor thread: Bluetooth radio, media sessions, album art |
 | `src/calendar.rs` | month grid maths (unit-tested) |
+| `src/theme_file.rs`, `src/watcher.rs` | theme parsing, live reload watcher (unit-tested parser) |
+| `src/hardening.rs`, `src/registry.rs` | process hardening, autostart / light-mode registry |
+| `build.rs`, `resources/` | embedded icon, manifest, version info |
+| `scripts/` | per-user install / uninstall |
 | `src/main.rs`, `src/shell/` | the shell app: bar, dock, flyout panels, tooltip |
 | `src/bin/spike.rs` | M1 spike |

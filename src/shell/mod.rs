@@ -40,7 +40,7 @@ use winshell::audio::{AUDIO_DEVICES_CHANGED, Audio, AudioDevice, AudioState, WM_
 use winshell::clock::{self, Clock};
 use winshell::config::{self, Config};
 use winshell::dock_model::DockModel;
-use winshell::dwm::{Backdrop, Corners, DwmStyle};
+use winshell::dwm::{self, Backdrop, Corners, DwmStyle};
 use winshell::foreground::{ForegroundTracker, WM_SHELL_FOREGROUND, WM_SHELL_TITLE};
 use winshell::instance::SingleInstance;
 use winshell::lru::Lru;
@@ -50,6 +50,8 @@ use winshell::power::{self, BatteryState, PowerNotifications};
 use winshell::render::Gfx;
 use winshell::sysmon::{MediaSession, SystemMonitor, WM_SHELL_MONITOR};
 use winshell::taskbar::{self, TaskbarGuard};
+use winshell::theme_file::{self, Palette};
+use winshell::watcher::{ConfigWatcher, WM_SHELL_CONFIG};
 use winshell::win::{self, MonitorGeometry, px};
 use winshell::winevents::{WM_SHELL_WINDOWS, WindowEventHooks};
 use winshell::{hotkey, log};
@@ -66,6 +68,24 @@ const FLYOUT_CLASS: PCWSTR = w!("WinShellTheme_FlyoutClass");
 
 const TIMER_CLOCK: usize = 1;
 const TIMER_TOOLTIP_HIDE: usize = 2;
+
+/// Second launch: ask the running instance to show its windows again.
+const WM_SHELL_RESTORE: u32 = WM_APP + 0x28;
+/// `winshell.exe --quit`: ask the running instance to exit cleanly (restoring the taskbar).
+/// UIPI stops lower-integrity processes from posting WM_APP messages to this window.
+const WM_SHELL_QUIT: u32 = WM_APP + 0x29;
+
+const USAGE: &str = "WinShellTheme (winshell.exe)
+
+  winshell.exe                      start the shell (a second launch shows the running one)
+  winshell.exe --quit               ask the running shell to exit cleanly
+  winshell.exe --restore-taskbar    put the native taskbar back from a leftover state file
+  winshell.exe --enable-autostart   start with Windows (HKCU Run value)
+  winshell.exe --disable-autostart  stop starting with Windows
+  winshell.exe --help
+
+Start options: --no-taskbar, --reserve layered|hidden|plan,
+               --backdrop acrylic|mica|tabbed|none, --corners round|small|none";
 
 const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -86,18 +106,28 @@ pub struct Options {
     style: DwmStyle,
     /// `--no-taskbar`: never touch the native taskbar this run.
     keep_taskbar: bool,
+    /// `--corners` given: overrides the theme's window_corners.
+    corners_override: bool,
 }
 
 impl Options {
     fn from_args() -> std::result::Result<Self, String> {
-        let mut o = Options { reserve: ReserveMode::Layered, style: DwmStyle::default(), keep_taskbar: false };
+        let mut o = Options {
+            reserve: ReserveMode::Layered,
+            style: DwmStyle::default(),
+            keep_taskbar: false,
+            corners_override: false,
+        };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             let mut val = |n: &str| args.next().ok_or(format!("{n} needs a value"));
             match a.as_str() {
                 "--reserve" => o.reserve = ReserveMode::parse(&val("--reserve")?).ok_or("bad --reserve")?,
                 "--backdrop" => o.style.backdrop = Backdrop::parse(&val("--backdrop")?).ok_or("bad --backdrop")?,
-                "--corners" => o.style.corners = Corners::parse(&val("--corners")?).ok_or("bad --corners")?,
+                "--corners" => {
+                    o.style.corners = Corners::parse(&val("--corners")?).ok_or("bad --corners")?;
+                    o.corners_override = true;
+                }
                 "--no-taskbar" => o.keep_taskbar = true,
                 "--autostart" => {}
                 other => return Err(format!("unknown argument {other}")),
@@ -206,11 +236,25 @@ pub struct App {
     pub media_bitmaps: HashMap<String, (usize, ID2D1Bitmap1)>,
     pub devices: Vec<AudioDevice>,
     pub panel: Option<PanelState>,
+    // M8
+    pub app_dir: PathBuf,
+    pub watcher: Option<ConfigWatcher>,
+    /// Exact text we last wrote to config.toml; the watcher's echo of it is ignored.
+    pub last_self_write: Option<String>,
 }
 
 pub fn main() {
+    let hardening_failures = winshell::hardening::harden_process();
     let dir = log::app_dir();
     log::init(dir.join("winshell.log"), cfg!(debug_assertions));
+    for f in hardening_failures {
+        log!("hardening not applied: {f}");
+    }
+
+    if let Some(code) = run_command_line(&dir) {
+        std::process::exit(code);
+    }
+
     install_panic_hook(dir.join("crash.log"));
     win::enable_per_monitor_dpi();
 
@@ -223,7 +267,12 @@ pub fn main() {
     };
 
     let Some(_instance) = SingleInstance::acquire(w!("Local\\WinShellTheme.SingleInstance")) else {
-        log!("another instance is already running; exiting");
+        log!("another instance is already running; asking it to show itself");
+        if let Some(h) = running_instance() {
+            unsafe {
+                let _ = PostMessageW(Some(h), WM_SHELL_RESTORE, WPARAM(0), LPARAM(0));
+            }
+        }
         return;
     };
 
@@ -235,8 +284,9 @@ pub fn main() {
     if let Some(e) = err {
         log!("config error, using defaults: {e}");
     }
+    ensure_theme_files(&dir);
 
-    log!("winshell M7 starting (reserve={}, {:?})", opts.reserve.name(), opts.style);
+    log!("winshell starting (reserve={}, {:?})", opts.reserve.name(), opts.style);
     if let Err(e) = run(opts, config, config_path, taskbar) {
         log!("fatal: {e:?}");
         cleanup_raw();
@@ -269,7 +319,166 @@ fn cleanup_raw() {
     }
 }
 
-fn run(opts: Options, config: Config, config_path: PathBuf, taskbar: TaskbarGuard) -> Result<()> {
+/// The running shell's top bar window, if any.
+fn running_instance() -> Option<HWND> {
+    unsafe { FindWindowW(TOPBAR_CLASS, None) }.ok().filter(|h| !h.0.is_null())
+}
+
+/// Print to the console that started us (the release exe has no console of its own).
+fn cli_print(msg: &str) {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+    println!("{msg}");
+}
+
+/// One-shot maintenance commands. Returns an exit code, or None to start the shell.
+fn run_command_line(dir: &std::path::Path) -> Option<i32> {
+    let first = std::env::args().nth(1)?;
+    match first.as_str() {
+        "--help" | "-h" | "/?" => {
+            cli_print(USAGE);
+            Some(0)
+        }
+        "--quit" => {
+            let Some(h) = running_instance() else {
+                cli_print("WinShellTheme is not running.");
+                return Some(0);
+            };
+            let mut pid = 0u32;
+            unsafe {
+                GetWindowThreadProcessId(h, Some(&mut pid));
+                let _ = PostMessageW(Some(h), WM_SHELL_QUIT, WPARAM(0), LPARAM(0));
+            }
+            // Wait (bounded) for it to finish restoring the taskbar and exit.
+            use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+            let exited = unsafe {
+                match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+                    Ok(p) => {
+                        let r = WaitForSingleObject(p, 10_000);
+                        let _ = CloseHandle(p);
+                        r == WAIT_OBJECT_0
+                    }
+                    Err(_) => true,
+                }
+            };
+            cli_print(if exited { "WinShellTheme exited." } else { "WinShellTheme did not exit within 10 seconds." });
+            Some(if exited { 0 } else { 1 })
+        }
+        "--restore-taskbar" => {
+            if running_instance().is_some() {
+                cli_print("WinShellTheme is running; use --quit (it restores the taskbar itself).");
+                return Some(1);
+            }
+            let path = dir.join("taskbar_state.toml");
+            let had_state = path.exists();
+            let _guard = TaskbarGuard::repair(path);
+            cli_print(if had_state { "Taskbar restored from the saved state." } else { "Nothing to restore." });
+            Some(0)
+        }
+        "--enable-autostart" => {
+            let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            match winshell::registry::enable_autostart(&exe) {
+                Ok(()) => {
+                    cli_print(&format!("Autostart enabled for {exe}"));
+                    Some(0)
+                }
+                Err(e) => {
+                    cli_print(&format!("Could not enable autostart: {e}"));
+                    Some(1)
+                }
+            }
+        }
+        "--disable-autostart" => match winshell::registry::disable_autostart() {
+            Ok(()) => {
+                cli_print("Autostart disabled.");
+                Some(0)
+            }
+            Err(e) => {
+                cli_print(&format!("Could not disable autostart: {e}"));
+                Some(1)
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Write the built-in theme files on first run (never overwrites edits).
+fn ensure_theme_files(dir: &std::path::Path) {
+    let themes = dir.join("themes");
+    let _ = std::fs::create_dir_all(&themes);
+    for (name, text) in
+        [("dark_glass.toml", theme_file::DARK_GLASS_TOML), ("light_clean.toml", theme_file::LIGHT_CLEAN_TOML)]
+    {
+        let p = themes.join(name);
+        if !p.exists() {
+            let _ = std::fs::write(p, text);
+        }
+    }
+}
+
+/// The palette for `config`: a named theme file, or Windows light/dark mode for
+/// `auto_system` / `follow_windows_theme`. Invalid names or files fall back to
+/// the built-in theme (errors are logged, never fatal).
+fn resolve_palette(config: &Config, dir: &std::path::Path) -> Palette {
+    let g = &config.general;
+    let follow = g.follow_windows_theme || g.theme.eq_ignore_ascii_case("auto_system");
+    let name = if follow {
+        if winshell::registry::apps_use_light_theme() { "light_clean".to_string() } else { "dark_glass".to_string() }
+    } else if g.theme.trim().is_empty() {
+        "dark_glass".to_string()
+    } else {
+        g.theme.trim().to_string()
+    };
+    let base = if name.eq_ignore_ascii_case("light_clean") { theme_file::LIGHT_CLEAN } else { theme_file::DARK_GLASS };
+    if !theme_file::valid_theme_name(&name) {
+        log!("theme: \"{name}\" is not a valid theme name (letters, digits, _ and - only); using built-in");
+        return base;
+    }
+    let path = dir.join("themes").join(format!("{name}.toml"));
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let (p, problems) = theme_file::parse(&text, base);
+            for pr in problems {
+                log!("theme {name}: {pr}");
+            }
+            p
+        }
+        Err(_) => {
+            log!("theme: {} not found; using built-in", path.display());
+            base
+        }
+    }
+}
+
+fn user_handle_for(config: &Config) -> String {
+    if config.general.user_handle.trim().is_empty() {
+        std::env::var("USERNAME").map(|u| format!("@{}", u.to_lowercase())).unwrap_or_else(|_| "@you".into())
+    } else {
+        config.general.user_handle.clone()
+    }
+}
+
+fn style_for(opts: &Options, p: &Palette) -> DwmStyle {
+    let mut style = opts.style;
+    style.dark = p.dark;
+    if !opts.corners_override {
+        style.corners = match p.window_corners {
+            theme_file::Corners::Round => Corners::Round,
+            theme_file::Corners::Small => Corners::Small,
+            theme_file::Corners::Square => Corners::Square,
+        };
+    }
+    style
+}
+
+fn run(mut opts: Options, config: Config, config_path: PathBuf, taskbar: TaskbarGuard) -> Result<()> {
+    let app_dir = config_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let palette = resolve_palette(&config, &app_dir);
+    set_pal(palette);
+    opts.style = style_for(&opts, &palette);
+
     win::register_class(TOPBAR_CLASS, wndproc)?;
     win::register_class(WINDOW_CLASS, wndproc)?;
     win::register_class(FLYOUT_CLASS, wndproc)?;
@@ -310,11 +519,7 @@ fn run(opts: Options, config: Config, config_path: PathBuf, taskbar: TaskbarGuar
 
     let monitor = MonitorGeometry::primary();
     let fonts = make_fonts(&gfx, monitor.scale())?;
-    let user_handle = if config.general.user_handle.trim().is_empty() {
-        std::env::var("USERNAME").map(|u| format!("@{}", u.to_lowercase())).unwrap_or_else(|_| "@you".into())
-    } else {
-        config.general.user_handle.clone()
-    };
+    let user_handle = user_handle_for(&config);
     let top_hwnd = top_bar.hwnd;
     let audio = Audio::new(top_hwnd);
     if audio.is_none() {
@@ -367,7 +572,13 @@ fn run(opts: Options, config: Config, config_path: PathBuf, taskbar: TaskbarGuar
         media_bitmaps: HashMap::new(),
         devices: Vec::new(),
         panel: None,
+        watcher: ConfigWatcher::start(&app_dir, top_hwnd),
+        app_dir,
+        last_self_write: None,
     };
+    if app.watcher.is_none() {
+        log!("config watcher unavailable; changes apply on restart");
+    }
     app.net_state = app.network.state();
     app.load_pins();
     app.rescan("startup");
@@ -648,8 +859,83 @@ impl App {
         self.media_bitmaps.get(app_id).map(|(_, b)| b)
     }
 
+    // ------------------------------------------------------------------
+    // M8: live reload
+    // ------------------------------------------------------------------
+
+    /// config.toml or a theme file changed on disk.
+    fn on_config_changed(&mut self) {
+        if let Some(w) = &self.watcher {
+            w.ack();
+        }
+        let text = std::fs::read_to_string(&self.config_path).ok();
+        if text.is_some() && text == self.last_self_write {
+            // Our own pin/unpin write: already applied. Theme files may still have changed.
+            self.last_self_write = None;
+            self.apply_theme();
+            self.redraw_everything();
+            return;
+        }
+        let new = match text.as_deref().map(config::parse) {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
+                log!("config.toml has an error, keeping the previous settings: {e}");
+                self.apply_theme();
+                self.redraw_everything();
+                return;
+            }
+            None => self.config.clone(), // deleted or locked mid-save: keep current settings
+        };
+        log!("config reloaded");
+        self.apply_settings(new);
+    }
+
+    fn apply_settings(&mut self, new: Config) {
+        let pins_changed = new.dock.pinned_apps != self.config.dock.pinned_apps;
+        let autohide_changed = new.taskbar.autohide_native != self.config.taskbar.autohide_native;
+        self.config = new;
+        self.user_handle = user_handle_for(&self.config);
+        if pins_changed {
+            self.load_pins();
+        }
+        if autohide_changed && !self.opts.keep_taskbar {
+            if self.config.taskbar.autohide_native {
+                self.taskbar.enable_autohide();
+            } else {
+                self.taskbar.restore();
+            }
+        }
+        self.apply_theme();
+        self.layout();
+        self.redraw_everything();
+    }
+
+    /// Re-resolve the palette and re-apply DWM attributes (dark frame, corners).
+    pub fn apply_theme(&mut self) {
+        let p = resolve_palette(&self.config, &self.app_dir);
+        set_pal(p);
+        let style = style_for(&self.opts, &p);
+        if style.dark != self.opts.style.dark || style.corners != self.opts.style.corners {
+            self.opts.style = style;
+            for h in [self.top_bar.hwnd, self.dock.hwnd, self.tooltip.hwnd, self.flyout.hwnd] {
+                dwm::apply(h, style);
+            }
+        }
+    }
+
+    fn redraw_everything(&mut self) {
+        self.tooltip.hide();
+        if self.panel.is_some() {
+            self.close_panel();
+        }
+        self.redraw_all();
+    }
+
     fn shutdown(&mut self) {
         log!("clean exit; {}", MemSnapshot::now().describe());
+        if let Some(w) = self.watcher.as_mut() {
+            w.stop();
+        }
         self.taskbar.restore();
         self.tracker.uninstall();
         self.window_hooks.uninstall();
@@ -725,11 +1011,25 @@ fn is_reserve(hwnd: HWND) -> bool {
 
 /// WM_SETTINGCHANGE with lParam "intl": regional format changed.
 fn is_intl_change(lp: LPARAM) -> bool {
+    setting_name(lp).eq_ignore_ascii_case("intl")
+}
+
+/// The area name in a WM_SETTINGCHANGE lParam ("intl", "ImmersiveColorSet", ...).
+/// The string comes from the system; it is read up to 64 UTF-16 units at most.
+fn setting_name(lp: LPARAM) -> String {
     if lp.0 == 0 {
-        return false;
+        return String::new();
     }
-    let s = unsafe { PCWSTR(lp.0 as *const u16).to_string() }.unwrap_or_default();
-    s.eq_ignore_ascii_case("intl")
+    let p = lp.0 as *const u16;
+    let mut out = Vec::new();
+    for i in 0..64 {
+        let c = unsafe { *p.add(i) };
+        if c == 0 {
+            break;
+        }
+        out.push(c);
+    }
+    String::from_utf16_lossy(&out)
 }
 
 fn mouse_point(lp: LPARAM) -> (f32, f32) {
@@ -828,6 +1128,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 BeginPaint(hwnd, &mut ps);
                 let _ = EndPaint(hwnd, &ps);
             }
+            LRESULT(0)
+        }
+        WM_SHELL_QUIT => {
+            log!("quit requested (--quit)");
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.shutdown());
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        WM_SHELL_RESTORE => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| {
+                log!("second launch: showing the shell");
+                a.fullscreen = true;
+                a.set_fullscreen(false);
+                a.layout();
+                a.redraw_all();
+            });
             LRESULT(0)
         }
         WM_HOTKEY if wp.0 as i32 == hotkey::ID_EMERGENCY => {
@@ -987,6 +1303,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMECHANGE => {
             with_app_on_bar(hwnd, msg, wp, lp, |a| a.resync_clock("WM_TIMECHANGE"));
+            LRESULT(0)
+        }
+        WM_SHELL_CONFIG => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_config_changed());
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE if setting_name(lp).eq_ignore_ascii_case("ImmersiveColorSet") => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| {
+                let g = &a.config.general;
+                if g.follow_windows_theme || g.theme.eq_ignore_ascii_case("auto_system") {
+                    a.apply_theme();
+                    a.redraw_everything();
+                }
+            });
             LRESULT(0)
         }
         WM_SETTINGCHANGE if is_intl_change(lp) => {

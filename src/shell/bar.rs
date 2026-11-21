@@ -134,15 +134,15 @@ pub fn battery_glyph(percent: u8, charging: bool) -> (char, u32) {
         } else {
             char::from_u32(glyph::BATTERY_CHARGING_0 + step.min(8)).unwrap()
         };
-        return (g, SUCCESS);
+        return (g, pal().success);
     }
     let g = if step >= 10 { glyph::BATTERY_FULL } else { char::from_u32(glyph::BATTERY_0 + step).unwrap() };
     let c = if percent < 10 {
-        DANGER
+        pal().danger
     } else if percent < 20 {
-        WARNING
+        pal().warning
     } else {
-        TEXT_PRIMARY
+        pal().text_primary
     };
     (g, c)
 }
@@ -156,10 +156,10 @@ fn network_glyph(s: &NetState) -> (char, u32) {
                 66..=89 => glyph::WIFI_3,
                 _ => glyph::WIFI,
             };
-            (g, TEXT_PRIMARY)
+            (g, pal().text_primary)
         }
-        NetState::Ethernet => (glyph::ETHERNET, TEXT_PRIMARY),
-        NetState::Disconnected => (glyph::WIFI, TEXT_DISABLED),
+        NetState::Ethernet => (glyph::ETHERNET, pal().text_primary),
+        NetState::Disconnected => (glyph::WIFI, pal().text_disabled),
     }
 }
 
@@ -373,28 +373,28 @@ impl App {
         let radius = self.opts.style.corners.approx_radius() * s;
         let (bw, bh) = (self.top_bar.width(), self.top_bar.height());
         let l = &self.bar;
-        let pill_r = PILL_RADIUS * s;
+        let pill_r = pal().pill_radius * s;
         let pad = PILL_PAD_X * s;
-        let bg = |hit: BarHit| if self.bar_hover == Some(hit) { PILL_HOVER } else { PILL_BG };
+        let bg = |hit: BarHit| if self.bar_hover == Some(hit) { pal().pill_hover } else { pal().pill_bg };
 
         let full = rectf(0.0, 0.0, bw, bh);
-        render::fill_round(dc, full, radius, GLASS_BG)?;
-        render::stroke_round(dc, full, radius, BORDER)?;
+        render::fill_round(dc, full, radius, pal().glass_bg)?;
+        render::stroke_round(dc, full, radius, pal().border)?;
 
         // Left zone.
-        render::fill_round(dc, l.user, pill_r, PILL_BG)?;
+        render::fill_round(dc, l.user, pill_r, pal().pill_bg)?;
         let user_text = D2D_RECT_F { left: l.user.left + pad, right: l.user.right - pad + 1.0, ..l.user };
-        render::text(dc, &self.user_handle, &self.fonts.pill, user_text, TEXT_SECONDARY)?;
-        render::fill_round(dc, l.divider, 0.0, BORDER)?;
+        render::text(dc, &self.user_handle, &self.fonts.pill, user_text, pal().text_secondary)?;
+        render::fill_round(dc, l.divider, 0.0, pal().border)?;
 
         render::fill_round(dc, l.active, pill_r, bg(BarHit::Active))?;
         if self.active.kind == Kind::App {
             match &self.active.icon {
                 Some(bmp) => render::draw_bitmap(dc, bmp, l.icon)?,
-                None => render::stroke_round(dc, l.icon, 3.0 * s, TEXT_DISABLED)?,
+                None => render::stroke_round(dc, l.icon, 3.0 * s, pal().text_disabled)?,
             }
         }
-        let title_color = if self.active.kind == Kind::Desktop { TEXT_SECONDARY } else { TEXT_PRIMARY };
+        let title_color = if self.active.kind == Kind::Desktop { pal().text_secondary } else { pal().text_primary };
         let title_box = D2D_RECT_F { right: l.title.right + 1.0, ..l.title };
         render::text(dc, &self.display_title(), &self.fonts.title, title_box, title_color)?;
 
@@ -403,7 +403,7 @@ impl App {
             render::fill_round(dc, *r, pill_r, bg(BarHit::Pill(*k)))?;
             match k {
                 PillKind::Bluetooth => {
-                    let c = if self.bluetooth == Some(true) { TEXT_PRIMARY } else { TEXT_DISABLED };
+                    let c = if self.bluetooth == Some(true) { pal().text_primary } else { pal().text_disabled };
                     render::glyph(dc, glyph::BLUETOOTH, &self.fonts.icon, *r, c)?;
                 }
                 PillKind::Wifi => {
@@ -412,7 +412,7 @@ impl App {
                 }
                 PillKind::Volume => {
                     let a = &self.audio_state;
-                    let c = if a.muted { TEXT_SECONDARY } else { TEXT_PRIMARY };
+                    let c = if a.muted { pal().text_secondary } else { pal().text_primary };
                     render::glyph(dc, volume_glyph(a.volume, a.muted), &self.fonts.icon, *r, c)?;
                 }
                 PillKind::Battery => {
@@ -425,15 +425,17 @@ impl App {
                         &self.battery_text(),
                         &self.fonts.pill,
                         D2D_RECT_F { left: tx, right: r.right, ..*r },
-                        TEXT_PRIMARY,
+                        pal().text_primary,
                     )?;
                 }
                 PillKind::Clock => {
                     let t = D2D_RECT_F { left: r.left + pad, right: r.right - pad + 1.0, ..*r };
-                    render::text(dc, &self.clock_text, &self.fonts.pill, t, TEXT_PRIMARY)?;
+                    render::text(dc, &self.clock_text, &self.fonts.pill, t, pal().text_primary)?;
                 }
-                PillKind::Notifications => render::glyph(dc, glyph::BELL, &self.fonts.icon, *r, TEXT_PRIMARY)?,
-                PillKind::QuickSettings => render::glyph(dc, glyph::SETTINGS, &self.fonts.icon, *r, TEXT_PRIMARY)?,
+                PillKind::Notifications => render::glyph(dc, glyph::BELL, &self.fonts.icon, *r, pal().text_primary)?,
+                PillKind::QuickSettings => {
+                    render::glyph(dc, glyph::SETTINGS, &self.fonts.icon, *r, pal().text_primary)?
+                }
             }
         }
         Ok(())
@@ -565,9 +567,9 @@ mod tests {
 
     #[test]
     fn battery_glyph_colours() {
-        assert_eq!(battery_glyph(5, false).1, DANGER);
-        assert_eq!(battery_glyph(15, false).1, WARNING);
+        assert_eq!(battery_glyph(5, false).1, pal().danger);
+        assert_eq!(battery_glyph(15, false).1, pal().warning);
         assert_eq!(battery_glyph(100, false).0, glyph::BATTERY_FULL);
-        assert_eq!(battery_glyph(50, true).1, SUCCESS);
+        assert_eq!(battery_glyph(50, true).1, pal().success);
     }
 }

@@ -93,9 +93,144 @@ pub fn darken(rgb: u32, factor: f32) -> u32 {
     (f(16) << 16) | (f(8) << 8) | f(0)
 }
 
+/// Is `name` (path relative to the watched folder) one we reload on?
+pub fn is_relevant(name: &str) -> bool {
+    let n = name.to_ascii_lowercase().replace('/', "\\");
+    if n == "config.toml" {
+        return true;
+    }
+    match n.strip_prefix("themes\\") {
+        Some(rest) => rest.ends_with(".toml") && !rest.contains('\\'),
+        None => false,
+    }
+}
+
+/// Walk a FILE_NOTIFY_INFORMATION chain in `buf[..len]`. Returns true if any
+/// record names a relevant file, or if the chain is malformed.
+pub fn buffer_has_relevant(buf: &[u8], len: usize) -> bool {
+    let len = len.min(buf.len());
+    if len == 0 {
+        return true; // overflow: the system dropped details, so reload to be safe
+    }
+    let mut off = 0usize;
+    loop {
+        // Header: NextEntryOffset, Action, FileNameLength (3 x u32).
+        let Some(hdr) = buf.get(off..off + 12) else { return true };
+        if off + 12 > len {
+            return true;
+        }
+        let next = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+        let name_len = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+        let start = off + 12;
+        let Some(end) = start.checked_add(name_len) else { return true };
+        if end > len || !name_len.is_multiple_of(2) {
+            return true;
+        }
+        let units: Vec<u16> = buf[start..end].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        if is_relevant(&String::from_utf16_lossy(&units)) {
+            return true;
+        }
+        if next == 0 {
+            return false;
+        }
+        match off.checked_add(next) {
+            Some(n) if n > off && n < len => off = n,
+            _ => return true,
+        }
+    }
+}
+
+/// The Run command for `exe`: the path quoted (so spaces cannot split it) plus `--autostart`.
+/// Returns None for paths containing a quote, which cannot be quoted safely.
+pub fn run_command(exe: &str) -> Option<String> {
+    if exe.contains('"') || exe.is_empty() {
+        return None;
+    }
+    Some(format!("\"{exe}\" --autostart"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(next: u32, name: &str) -> Vec<u8> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let mut v = Vec::new();
+        v.extend_from_slice(&next.to_le_bytes());
+        v.extend_from_slice(&3u32.to_le_bytes()); // FILE_ACTION_MODIFIED
+        v.extend_from_slice(&((units.len() * 2) as u32).to_le_bytes());
+        for u in units {
+            v.extend_from_slice(&u.to_le_bytes());
+        }
+        while v.len() % 4 != 0 {
+            v.push(0);
+        }
+        v
+    }
+
+    #[test]
+    fn relevant_names() {
+        assert!(is_relevant("config.toml"));
+        assert!(is_relevant("CONFIG.TOML"));
+        assert!(is_relevant("themes\\dark_glass.toml"));
+        assert!(!is_relevant("winshell.log"));
+        assert!(!is_relevant("taskbar_state.toml"));
+        assert!(!is_relevant("themes\\sub\\x.toml"));
+        assert!(!is_relevant("cache\\icons\\a.toml"));
+    }
+
+    #[test]
+    fn notify_chain_irrelevant_only() {
+        let a = record(0, "winshell.log");
+        assert!(!buffer_has_relevant(&a, a.len()));
+    }
+
+    #[test]
+    fn notify_chain_finds_second_record() {
+        let mut a = record(0, "winshell.log");
+        let first_len = a.len() as u32;
+        a[0..4].copy_from_slice(&first_len.to_le_bytes());
+        a.extend(record(0, "config.toml"));
+        assert!(buffer_has_relevant(&a, a.len()));
+    }
+
+    #[test]
+    fn notify_overflow_and_malformed_are_treated_as_changes() {
+        let a = record(0, "winshell.log");
+        assert!(buffer_has_relevant(&a, 0)); // overflow
+        assert!(buffer_has_relevant(&a, 8)); // truncated header
+        let mut bad_len = a.clone();
+        bad_len[8..12].copy_from_slice(&10_000u32.to_le_bytes());
+        assert!(buffer_has_relevant(&bad_len, bad_len.len()));
+        let mut loop_back = a.clone();
+        loop_back[0..4].copy_from_slice(&0u32.wrapping_sub(4).to_le_bytes()); // huge offset
+        assert!(buffer_has_relevant(&loop_back, loop_back.len()));
+        let mut odd = a.clone();
+        odd[8..12].copy_from_slice(&3u32.to_le_bytes());
+        assert!(buffer_has_relevant(&odd, odd.len()));
+    }
+
+    #[test]
+    fn notify_parser_never_reads_past_len() {
+        // Exhaustively feed every prefix length of a two-record chain: no panic.
+        let mut a = record(0, "winshell.log");
+        let n = a.len() as u32;
+        a[0..4].copy_from_slice(&n.to_le_bytes());
+        a.extend(record(0, "crash.log"));
+        for len in 0..=a.len() + 8 {
+            let _ = buffer_has_relevant(&a, len);
+        }
+    }
+
+    #[test]
+    fn run_command_quotes_path() {
+        assert_eq!(
+            run_command("C:\\Users\\A B\\winshell.exe").unwrap(),
+            "\"C:\\Users\\A B\\winshell.exe\" --autostart"
+        );
+        assert_eq!(run_command("C:\\x\"y.exe"), None);
+        assert_eq!(run_command(""), None);
+    }
 
     #[test]
     fn tint_prefers_saturated_colour() {

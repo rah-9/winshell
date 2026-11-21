@@ -105,7 +105,7 @@ fn paint_start_glyph(dc: &ID2D1DeviceContext, slot: D2D_RECT_F, s: f32) -> Resul
     let y0 = (slot.top + (slot.bottom - slot.top - total) / 2.0).round();
     for (cx, cy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
         let r = rectf(x0 + cx * (cell + gap), y0 + cy * (cell + gap), cell, cell);
-        render::fill_round(dc, r, 1.5 * s, START_GLYPH_COLOR)?;
+        render::fill_round(dc, r, 1.5 * s, pal().start_glyph)?;
     }
     Ok(())
 }
@@ -369,10 +369,10 @@ impl App {
         let (dw, dh) = (self.dock.width(), self.dock.height());
         let l = &self.dock_layout;
         let full = rectf(0.0, 0.0, dw, dh);
-        render::fill_round(dc, full, radius, GLASS_BG)?;
-        render::stroke_round(dc, full, radius, BORDER)?;
+        render::fill_round(dc, full, radius, pal().glass_bg)?;
+        render::stroke_round(dc, full, radius, pal().border)?;
 
-        let hover_bg = |r: D2D_RECT_F| render::fill_round(dc, r, DOCK_SLOT_RADIUS * s, PILL_HOVER);
+        let hover_bg = |r: D2D_RECT_F| render::fill_round(dc, r, pal().icon_slot_radius * s, pal().pill_hover);
 
         if self.dock_hover == Some(DockHit::Start) {
             hover_bg(l.start)?;
@@ -381,7 +381,7 @@ impl App {
 
         let sep_h = DOCK_SEPARATOR_HEIGHT * s;
         for x in &l.separators {
-            render::fill_round(dc, rectf(*x, ((dh - sep_h) / 2.0).round(), 1.0, sep_h), 0.0, BORDER)?;
+            render::fill_round(dc, rectf(*x, ((dh - sep_h) / 2.0).round(), 1.0, sep_h), 0.0, pal().border)?;
         }
 
         let focused = self.dock_model.focused();
@@ -402,13 +402,13 @@ impl App {
             let dest = rectf((cx - icon_sz / 2.0).round(), (cy - base / 2.0 - grow).round(), icon_sz, icon_sz);
             match &bitmaps[i] {
                 Some(bmp) => render::draw_bitmap(dc, bmp, dest)?,
-                None => render::fill_round(dc, dest, DOCK_SLOT_RADIUS * s, PILL_BG)?,
+                None => render::fill_round(dc, dest, pal().icon_slot_radius * s, pal().pill_bg)?,
             }
             if g.windows.iter().any(|w| w.is_elevated) {
                 let b = 16.0 * s;
                 let badge = rectf(dest.right - b + 2.0 * s, dest.bottom - b + 2.0 * s, b, b);
-                render::fill_round(dc, badge, b / 2.0, 0x14161CE6)?;
-                render::glyph(dc, glyph::ADMIN, &self.fonts.icon_small, badge, WARNING)?;
+                render::fill_round(dc, badge, b / 2.0, (pal().glass_bg & 0xFFFFFF00) | 0xE6)?;
+                render::glyph(dc, glyph::ADMIN, &self.fonts.icon_small, badge, pal().warning)?;
             }
 
             // Below the slot: focused pill, else multi-window dots, else running dot.
@@ -418,37 +418,38 @@ impl App {
             let iy = slot.bottom + INDICATOR_GAP * s;
             if focused == Some(*gi) {
                 let (w, h) = (FOCUS_PILL_W * s, FOCUS_PILL_H * s);
-                render::fill_round(dc, rectf(cx - w / 2.0, iy, w, h), h / 2.0, ACCENT)?;
+                render::fill_round(dc, rectf(cx - w / 2.0, iy, w, h), h / 2.0, pal().accent)?;
             } else if g.windows.len() > 1 {
                 let d = MULTI_DOT * s;
                 let gap = INDICATOR_GAP * s;
                 let x0 = cx - d - gap / 2.0;
-                render::fill_round(dc, rectf(x0, iy, d, d), d / 2.0, RUNNING_DOT_COLOR)?;
-                render::fill_round(dc, rectf(x0 + d + gap, iy, d, d), d / 2.0, RUNNING_DOT_COLOR)?;
+                render::fill_round(dc, rectf(x0, iy, d, d), d / 2.0, pal().running_dot)?;
+                render::fill_round(dc, rectf(x0 + d + gap, iy, d, d), d / 2.0, pal().running_dot)?;
             } else {
                 let d = RUNNING_DOT * s;
-                render::fill_round(dc, rectf(cx - d / 2.0, iy, d, d), d / 2.0, RUNNING_DOT_COLOR)?;
+                render::fill_round(dc, rectf(cx - d / 2.0, iy, d, d), d / 2.0, pal().running_dot)?;
             }
         }
 
         if let (Some(m), Some(session)) = (&l.media, self.media.first()) {
-            let bg = if self.dock_hover == Some(DockHit::Media(MediaPart::Body)) { PILL_HOVER } else { PILL_BG };
-            render::fill_round(dc, m.pill, DOCK_SLOT_RADIUS * s, bg)?;
+            let bg =
+                if self.dock_hover == Some(DockHit::Media(MediaPart::Body)) { pal().pill_hover } else { pal().pill_bg };
+            render::fill_round(dc, m.pill, pal().icon_slot_radius * s, bg)?;
             match self.media_bitmap(&session.app_id) {
                 Some(b) => render::draw_bitmap(dc, b, m.art)?,
                 None => {
-                    render::fill_round(dc, m.art, 6.0 * s, PILL_HOVER)?;
-                    render::glyph(dc, glyph::MUSIC, &self.fonts.icon, m.art, TEXT_SECONDARY)?;
+                    render::fill_round(dc, m.art, 6.0 * s, pal().pill_hover)?;
+                    render::glyph(dc, glyph::MUSIC, &self.fonts.icon, m.art, pal().text_secondary)?;
                 }
             }
             let title = if session.title.is_empty() { "Unknown title" } else { session.title.as_str() };
-            render::text(dc, title, &self.fonts.body_bold, m.title, TEXT_PRIMARY)?;
-            render::text(dc, &session.artist, &self.fonts.sub, m.artist, TEXT_SECONDARY)?;
+            render::text(dc, title, &self.fonts.body_bold, m.title, pal().text_primary)?;
+            render::text(dc, &session.artist, &self.fonts.sub, m.artist, pal().text_secondary)?;
             if self.dock_hover == Some(DockHit::Media(MediaPart::PlayPause)) {
-                render::fill_round(dc, m.play, (MEDIA_BUTTON * s) / 2.0, PILL_HOVER)?;
+                render::fill_round(dc, m.play, (MEDIA_BUTTON * s) / 2.0, pal().pill_hover)?;
             }
             let g = if session.playing { glyph::PAUSE } else { glyph::PLAY };
-            let c = if session.can_play_pause { TEXT_PRIMARY } else { TEXT_DISABLED };
+            let c = if session.can_play_pause { pal().text_primary } else { pal().text_disabled };
             render::glyph(dc, g, &self.fonts.icon, m.play, c)?;
         }
         Ok(())
@@ -476,14 +477,14 @@ impl App {
             .surface
             .draw(|dc| {
                 let full = rectf(0.0, 0.0, tw, th);
-                render::fill_round(dc, full, radius, GLASS_BG)?;
-                render::stroke_round(dc, full, radius, BORDER)?;
+                render::fill_round(dc, full, radius, pal().glass_bg)?;
+                render::stroke_round(dc, full, radius, pal().border)?;
                 render::text_aligned(
                     dc,
                     text,
                     &fonts.pill,
                     full,
-                    TEXT_PRIMARY,
+                    pal().text_primary,
                     windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_CENTER,
                 )
             })
@@ -680,8 +681,10 @@ impl App {
                 return;
             }
         };
-        // M8's file watcher must ignore this self-write.
+        // Remember the exact text so the file watcher ignores its own echo.
+        self.last_self_write = Some(updated.clone());
         if let Err(e) = std::fs::write(&self.config_path, &updated) {
+            self.last_self_write = None;
             log!("pin: write failed ({e})");
             return;
         }

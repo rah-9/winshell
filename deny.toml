@@ -1,0 +1,24 @@
+# cargo-deny policy (PLAN.md section 9). Run: cargo deny check
+[graph]
+targets = ["x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"]
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"  # the windows-* family often brings several windows-sys versions
+wildcards = "deny"
+deny = [
+    # No network stack in this app (PLAN.md section 1).
+    { name = "reqwest" }, { name = "hyper" }, { name = "tokio" }, { name = "socket2" },
+    { name = "ureq" }, { name = "mio" }, { name = "curl" }, { name = "native-tls" }, { name = "rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -18,6 +18,10 @@ pub struct Config {
 pub struct General {
     /// Shown in the top bar's user pill. Empty = "@" + Windows user name.
     pub user_handle: String,
+    /// "dark_glass", "light_clean", any file name in themes\ (without .toml), or "auto_system".
+    pub theme: String,
+    /// Follow Windows light/dark mode (picks dark_glass or light_clean).
+    pub follow_windows_theme: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -66,10 +70,12 @@ impl Default for Taskbar {
 
 /// Written on first run. Comments survive pin/unpin edits.
 pub const DEFAULT_CONFIG: &str = r#"# WinShellTheme configuration
-# Changes take effect on restart (live reload arrives in a later version).
+# Saved changes apply live (themes too: see the themes folder next to this file).
 
 [general]
 user_handle = ""                 # empty = "@" + your Windows user name
+theme = "dark_glass"             # "dark_glass", "light_clean", a file in themes\ (no .toml), or "auto_system"
+follow_windows_theme = false     # true = follow Windows light/dark mode
 
 [top_bar]
 enabled_pills = ["bluetooth", "wifi", "volume", "battery", "clock", "notifications", "quick_settings"]

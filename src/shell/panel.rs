@@ -26,7 +26,6 @@ use super::bar::{battery_glyph, volume_glyph};
 use super::dock::group_name;
 use super::theme::*;
 
-const HOVER_OVERLAY: u32 = 0xFFFFFF14;
 const MAX_MEDIA_CARDS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,13 +128,13 @@ impl Builder {
     fn header(&mut self, t: &str) {
         let (l, r) = self.inner();
         let s = self.s;
-        self.text(t, Font::Header, rectf(l, self.y, r - l, 24.0 * s), TEXT_PRIMARY, Align::Leading);
+        self.text(t, Font::Header, rectf(l, self.y, r - l, 24.0 * s), pal().text_primary, Align::Leading);
         self.y += 24.0 * s + 8.0 * s;
     }
     fn divider(&mut self) {
         let (l, r) = self.inner();
         self.y += 6.0 * self.s;
-        self.fill(rectf(l, self.y.round(), r - l, 1.0), 0.0, BORDER);
+        self.fill(rectf(l, self.y.round(), r - l, 1.0), 0.0, pal().border);
         self.y += 7.0 * self.s;
     }
     fn link(&mut self, label: &str, uri: &'static str) {
@@ -146,7 +145,7 @@ impl Builder {
             label,
             Font::Pill,
             D2D_RECT_F { left: row.left + 6.0 * s, right: row.right - 6.0 * s, ..row },
-            ACCENT,
+            pal().accent,
             Align::Trailing,
         );
         self.hit(PanelHit::Link(uri), row, true);
@@ -165,15 +164,21 @@ impl Builder {
         let track_r = r - label_w - 8.0 * s;
         let cy = self.y + h / 2.0;
         let th = 4.0 * s;
-        self.fill(rectf(track_l, cy - th / 2.0, track_r - track_l, th), th / 2.0, SLIDER_TRACK);
+        self.fill(rectf(track_l, cy - th / 2.0, track_r - track_l, th), th / 2.0, pal().slider_track);
         let vx = track_l + (track_r - track_l) * value.clamp(0.0, 1.0);
-        self.fill(rectf(track_l, cy - th / 2.0, (vx - track_l).max(th), th), th / 2.0, ACCENT);
+        self.fill(rectf(track_l, cy - th / 2.0, (vx - track_l).max(th), th), th / 2.0, pal().accent);
         let k = 16.0 * s;
-        self.fill(rectf(vx - k / 2.0, cy - k / 2.0, k, k), k / 2.0, TEXT_PRIMARY);
-        self.fill(rectf(vx - k / 4.0, cy - k / 4.0, k / 2.0, k / 2.0), k / 4.0, ACCENT);
+        self.fill(rectf(vx - k / 2.0, cy - k / 2.0, k, k), k / 2.0, pal().text_primary);
+        self.fill(rectf(vx - k / 4.0, cy - k / 4.0, k / 2.0, k / 2.0), k / 4.0, pal().accent);
         self.hit(PanelHit::Slider(kind), rectf(track_l - k / 2.0, self.y, track_r - track_l + k, h), false);
         let pct = (value.clamp(0.0, 1.0) * 100.0).round() as u32;
-        self.text(pct.to_string(), Font::Body, rectf(r - label_w, self.y, label_w, h), TEXT_PRIMARY, Align::Trailing);
+        self.text(
+            pct.to_string(),
+            Font::Body,
+            rectf(r - label_w, self.y, label_w, h),
+            pal().text_primary,
+            Align::Trailing,
+        );
         self.y += h;
     }
 }
@@ -253,10 +258,10 @@ impl App {
         let a = self.audio_state;
         b.header("Sound");
         if self.audio.is_some() && a.available {
-            let c = if a.muted { TEXT_SECONDARY } else { TEXT_PRIMARY };
+            let c = if a.muted { pal().text_secondary } else { pal().text_primary };
             b.slider_row(SliderKind::Volume, volume_glyph(a.volume, a.muted), c, a.volume, PanelHit::ToggleMute);
             if a.mic_available {
-                let c = if a.mic_muted { DANGER } else { TEXT_PRIMARY };
+                let c = if a.mic_muted { pal().danger } else { pal().text_primary };
                 b.slider_row(SliderKind::Mic, glyph::MIC, c, a.mic_volume, PanelHit::ToggleMicMute);
             }
             b.link("Volume mixer", "ms-settings:apps-volume");
@@ -266,7 +271,7 @@ impl App {
                 "No audio output device",
                 Font::Body,
                 rectf(l, b.y, r - l, 28.0 * s),
-                TEXT_SECONDARY,
+                pal().text_secondary,
                 Align::Leading,
             );
             b.y += 28.0 * s;
@@ -275,20 +280,26 @@ impl App {
         if !self.devices.is_empty() {
             b.divider();
             let (l, r) = b.inner();
-            b.text("Output device", Font::Sub, rectf(l, b.y, r - l, 20.0 * s), TEXT_SECONDARY, Align::Leading);
+            b.text("Output device", Font::Sub, rectf(l, b.y, r - l, 20.0 * s), pal().text_secondary, Align::Leading);
             b.y += 22.0 * s;
             for d in &self.devices {
                 let row = rectf(l, b.y, r - l, 32.0 * s);
                 let k = 14.0 * s;
                 let dot = rectf(l + 6.0 * s, b.y + (32.0 * s - k) / 2.0, k, k);
                 if d.is_default {
-                    b.fill(dot, k / 2.0, ACCENT);
-                    b.fill(rectf(dot.left + k * 0.3, dot.top + k * 0.3, k * 0.4, k * 0.4), k * 0.2, 0x14161CFF);
+                    b.fill(dot, k / 2.0, pal().accent);
+                    b.fill(rectf(dot.left + k * 0.3, dot.top + k * 0.3, k * 0.4, k * 0.4), k * 0.2, pal().on_accent);
                 } else {
-                    b.items.push(Item::Stroke(dot, k / 2.0, TEXT_SECONDARY));
+                    b.items.push(Item::Stroke(dot, k / 2.0, pal().text_secondary));
                 }
                 let tl = dot.right + 10.0 * s;
-                b.text(&d.name, Font::Body, rectf(tl, b.y, r - tl - 6.0 * s, 32.0 * s), TEXT_PRIMARY, Align::Leading);
+                b.text(
+                    &d.name,
+                    Font::Body,
+                    rectf(tl, b.y, r - tl - 6.0 * s, 32.0 * s),
+                    pal().text_primary,
+                    Align::Leading,
+                );
                 b.hit(PanelHit::Device(d.id.clone()), row, true);
                 b.y += 32.0 * s;
             }
@@ -298,14 +309,14 @@ impl App {
             b.y += 8.0 * s;
             let (l, r) = b.inner();
             let card = rectf(l, b.y, r - l, 72.0 * s);
-            let bg = m.tint.map(|t| (darken(t, 0.38) << 8) | 0xE6).unwrap_or(PILL_BG);
+            let bg = m.tint.map(|t| (darken(t, 0.38) << 8) | 0xE6).unwrap_or(pal().pill_bg);
             b.fill(card, 10.0 * s, bg);
             let art = rectf(card.left + 10.0 * s, card.top + 10.0 * s, 52.0 * s, 52.0 * s);
             match self.media_bitmap(&m.app_id) {
                 Some(bmp) => b.items.push(Item::Bitmap(bmp.clone(), art)),
                 None => {
-                    b.fill(art, 6.0 * s, PILL_HOVER);
-                    b.glyph(glyph::MUSIC, art, TEXT_SECONDARY);
+                    b.fill(art, 6.0 * s, pal().pill_hover);
+                    b.glyph(glyph::MUSIC, art, pal().text_secondary);
                 }
             }
             let btn = 24.0 * s;
@@ -313,8 +324,20 @@ impl App {
             let tx = art.right + 10.0 * s;
             let tw = (card.right - 10.0 * s - buttons_w - 8.0 * s - tx).max(0.0);
             let title = if m.title.is_empty() { "Unknown title" } else { m.title.as_str() };
-            b.text(title, Font::BodyBold, rectf(tx, card.top + 14.0 * s, tw, 22.0 * s), TEXT_PRIMARY, Align::Leading);
-            b.text(&m.artist, Font::Sub, rectf(tx, card.top + 36.0 * s, tw, 20.0 * s), TEXT_SECONDARY, Align::Leading);
+            b.text(
+                title,
+                Font::BodyBold,
+                rectf(tx, card.top + 14.0 * s, tw, 22.0 * s),
+                pal().text_primary,
+                Align::Leading,
+            );
+            b.text(
+                &m.artist,
+                Font::Sub,
+                rectf(tx, card.top + 36.0 * s, tw, 20.0 * s),
+                pal().text_secondary,
+                Align::Leading,
+            );
             let by = card.top + (72.0 * s - btn) / 2.0;
             let mut bx = card.right - 10.0 * s - buttons_w;
             for (g, cmd, enabled) in [
@@ -323,7 +346,7 @@ impl App {
                 (glyph::NEXT, MediaCommand::Next, m.can_next),
             ] {
                 let r = rectf(bx, by, btn, btn);
-                b.glyph(g, r, if enabled { TEXT_PRIMARY } else { TEXT_DISABLED });
+                b.glyph(g, r, if enabled { pal().text_primary } else { pal().text_disabled });
                 if enabled {
                     b.hit(PanelHit::Media(m.app_id.clone(), cmd), r, true);
                 }
@@ -339,7 +362,13 @@ impl App {
         b.header("Battery");
         let (l, r) = b.inner();
         if !bat.present {
-            b.text("No battery detected", Font::Body, rectf(l, b.y, r - l, 28.0 * s), TEXT_SECONDARY, Align::Leading);
+            b.text(
+                "No battery detected",
+                Font::Body,
+                rectf(l, b.y, r - l, 28.0 * s),
+                pal().text_secondary,
+                Align::Leading,
+            );
             b.y += 28.0 * s;
         } else {
             let (g, c) = battery_glyph(bat.percent, bat.charging);
@@ -348,7 +377,7 @@ impl App {
                 format!("{}%", bat.percent),
                 Font::Big,
                 rectf(l + 40.0 * s, b.y, r - l - 40.0 * s, 44.0 * s),
-                TEXT_PRIMARY,
+                pal().text_primary,
                 Align::Leading,
             );
             b.y += 48.0 * s;
@@ -362,15 +391,20 @@ impl App {
             } else {
                 "On battery".to_string()
             };
-            b.text(status, Font::Body, rectf(l, b.y, r - l, 24.0 * s), TEXT_SECONDARY, Align::Leading);
+            b.text(status, Font::Body, rectf(l, b.y, r - l, 24.0 * s), pal().text_secondary, Align::Leading);
             b.y += 24.0 * s;
             if bat.saver {
-                b.items.push(Item::Glyph(glyph::BATTERY_SAVER, Font::Icon, rectf(l, b.y, 20.0 * s, 24.0 * s), WARNING));
+                b.items.push(Item::Glyph(
+                    glyph::BATTERY_SAVER,
+                    Font::Icon,
+                    rectf(l, b.y, 20.0 * s, 24.0 * s),
+                    pal().warning,
+                ));
                 b.text(
                     "Energy saver is on",
                     Font::Body,
                     rectf(l + 26.0 * s, b.y, r - l, 24.0 * s),
-                    WARNING,
+                    pal().warning,
                     Align::Leading,
                 );
                 b.y += 24.0 * s;
@@ -394,7 +428,7 @@ impl App {
             clock::format_date(year, month, 1, "MMMM yyyy"),
             Font::BodyBold,
             D2D_RECT_F { left: title_r.left + 6.0 * s, ..title_r },
-            TEXT_PRIMARY,
+            pal().text_primary,
             Align::Leading,
         );
         if (year, month) != (ty, tm) {
@@ -402,8 +436,8 @@ impl App {
         }
         let prev = rectf(r - 2.0 * btn - 4.0 * s, b.y, btn, row_h);
         let next = rectf(r - btn, b.y, btn, row_h);
-        b.glyph(glyph::CHEVRON_LEFT, prev, TEXT_PRIMARY);
-        b.glyph(glyph::CHEVRON_RIGHT, next, TEXT_PRIMARY);
+        b.glyph(glyph::CHEVRON_LEFT, prev, pal().text_primary);
+        b.glyph(glyph::CHEVRON_RIGHT, next, pal().text_primary);
         b.hit(PanelHit::CalPrev, prev, true);
         b.hit(PanelHit::CalNext, next, true);
         b.y += row_h + 6.0 * s;
@@ -414,7 +448,13 @@ impl App {
         for i in 0..7u32 {
             let wd = (first + i) % 7; // 0 = Sunday
             let name: String = clock::format_date(2026, 11, 1 + wd, "ddd").chars().take(2).collect();
-            b.text(name, Font::Sub, rectf(l + i as f32 * cell_w, b.y, cell_w, 20.0 * s), TEXT_SECONDARY, Align::Center);
+            b.text(
+                name,
+                Font::Sub,
+                rectf(l + i as f32 * cell_w, b.y, cell_w, 20.0 * s),
+                pal().text_secondary,
+                Align::Center,
+            );
         }
         b.y += 24.0 * s;
 
@@ -425,17 +465,17 @@ impl App {
             let cell = rectf(l + col * cell_w, b.y + row * cell_h, cell_w, cell_h);
             let is_today = (y, m, d) == (ty, tm, td);
             let color = if is_today {
-                0x14161CFF
+                pal().on_accent
             } else if in_month {
-                TEXT_PRIMARY
+                pal().text_primary
             } else {
-                TEXT_DISABLED
+                pal().text_disabled
             };
             if is_today {
                 let k = 28.0 * s;
                 let cx = (cell.left + cell.right) / 2.0;
                 let cy = (cell.top + cell.bottom) / 2.0;
-                b.fill(rectf(cx - k / 2.0, cy - k / 2.0, k, k), k / 2.0, ACCENT);
+                b.fill(rectf(cx - k / 2.0, cy - k / 2.0, k, k), k / 2.0, pal().accent);
             }
             b.text(d.to_string(), Font::Body, cell, color, Align::Center);
         }
@@ -458,11 +498,11 @@ impl App {
         for (i, w) in g.windows.iter().enumerate() {
             let row = rectf(l, b.y, r - l, 32.0 * s);
             if focused && i == g.active_window_idx {
-                b.fill(rectf(l, b.y + 8.0 * s, 3.0 * s, 16.0 * s), 1.5 * s, ACCENT);
+                b.fill(rectf(l, b.y + 8.0 * s, 3.0 * s, 16.0 * s), 1.5 * s, pal().accent);
             }
             let mut tr = r - 6.0 * s;
             if w.is_elevated {
-                b.glyph(glyph::ADMIN, rectf(r - 24.0 * s, b.y, 24.0 * s, 32.0 * s), WARNING);
+                b.glyph(glyph::ADMIN, rectf(r - 24.0 * s, b.y, 24.0 * s, 32.0 * s), pal().warning);
                 tr -= 24.0 * s;
             }
             let title = if w.title.is_empty() { "Untitled window" } else { w.title.as_str() };
@@ -470,7 +510,7 @@ impl App {
                 title,
                 Font::Body,
                 rectf(l + 12.0 * s, b.y, tr - l - 12.0 * s, 32.0 * s),
-                TEXT_PRIMARY,
+                pal().text_primary,
                 Align::Leading,
             );
             b.hit(PanelHit::Activate(w.hwnd, w.is_elevated), row, true);
@@ -478,7 +518,7 @@ impl App {
         }
         b.divider();
         let row = rectf(l, b.y, r - l, 32.0 * s);
-        b.text("New window", Font::Body, D2D_RECT_F { left: l + 12.0 * s, ..row }, ACCENT, Align::Leading);
+        b.text("New window", Font::Body, D2D_RECT_F { left: l + 12.0 * s, ..row }, pal().accent, Align::Leading);
         b.hit(PanelHit::NewWindow(g.id.clone()), row, true);
         b.y += 32.0 * s;
     }
@@ -514,7 +554,7 @@ impl App {
         let result = (|| -> Result<()> {
             self.flyout.surface.draw(|dc| self.paint_panel(dc))?;
             if animate {
-                self.flyout.surface.animate_open(&self.gfx, from_y, MOTION_MS)?;
+                self.flyout.surface.animate_open(&self.gfx, from_y, pal().motion_ms)?;
             }
             self.gfx.commit()
         })();
@@ -554,8 +594,8 @@ impl App {
         let s = self.scale();
         let radius = self.opts.style.corners.approx_radius() * s;
         let full = rectf(0.0, 0.0, self.flyout.width(), self.flyout.height());
-        render::fill_round(dc, full, radius, GLASS_BG)?;
-        render::stroke_round(dc, full, radius, BORDER)?;
+        render::fill_round(dc, full, radius, pal().glass_bg)?;
+        render::stroke_round(dc, full, radius, pal().border)?;
         for item in &p.items {
             match item {
                 Item::Fill(r, rad, c) => render::fill_round(dc, *r, *rad, *c)?,
@@ -573,7 +613,7 @@ impl App {
             }
         }
         if let Some((_, r, true)) = p.hover.and_then(|i| p.hits.get(i)) {
-            render::fill_round(dc, *r, 6.0 * s, HOVER_OVERLAY)?;
+            render::fill_round(dc, *r, 6.0 * s, pal().hover_overlay)?;
         }
         Ok(())
     }

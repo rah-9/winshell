@@ -1,21 +1,22 @@
-//! Theme tokens and layout constants (PLAN.md sections 2 and 3, dark theme at
-//! 100% scale). Themes become configurable in M8.
+//! Layout constants (PLAN.md section 2, 100% scale) and the runtime theme palette.
 
-// Colours, 0xRRGGBBAA.
-pub const GLASS_BG: u32 = 0x14161CB7;
-pub const PILL_BG: u32 = 0x1E212A99;
-pub const PILL_HOVER: u32 = 0x2A2E3AB2;
-pub const BORDER: u32 = 0xFFFFFF1F;
-pub const TEXT_PRIMARY: u32 = 0xF2F4F8FF;
-pub const TEXT_SECONDARY: u32 = 0xA8AEBBFF;
-pub const TEXT_DISABLED: u32 = 0x6A7080FF;
-pub const ACCENT: u32 = 0x6EA8FEFF;
-pub const SUCCESS: u32 = 0x4ADE80FF;
-pub const WARNING: u32 = 0xFACC15FF;
-pub const DANGER: u32 = 0xF87171FF;
-pub const RUNNING_DOT_COLOR: u32 = 0xFFFFFF99;
-pub const START_GLYPH_COLOR: u32 = 0xF2F4F8E6;
-pub const SLIDER_TRACK: u32 = 0xFFFFFF33;
+use std::cell::Cell;
+
+use winshell::theme_file::{DARK_GLASS, Palette};
+
+// Colours, geometry and motion come from the active theme (M8). The palette
+// lives on the UI thread and is swapped atomically when a theme file changes.
+thread_local! {
+    static PALETTE: Cell<Palette> = const { Cell::new(DARK_GLASS) };
+}
+
+pub fn pal() -> Palette {
+    PALETTE.with(|p| p.get())
+}
+
+pub fn set_pal(p: Palette) {
+    PALETTE.with(|c| c.set(p));
+}
 
 // Reservations and top bar.
 pub const TOP_RESERVE: f32 = 44.0;
@@ -24,7 +25,6 @@ pub const BAR_MARGIN: f32 = 8.0;
 pub const BAR_HEIGHT: f32 = 36.0;
 pub const BAR_EDGE_INSET: f32 = 4.0;
 pub const PILL_HEIGHT: f32 = 28.0;
-pub const PILL_RADIUS: f32 = 14.0;
 pub const PILL_PAD_X: f32 = 10.0;
 pub const PILL_GAP: f32 = 6.0;
 pub const ICON_PILL_W: f32 = 28.0;
@@ -39,7 +39,6 @@ pub const DOCK_MARGIN_BOTTOM: f32 = 10.0;
 pub const DOCK_PAD_X: f32 = 10.0;
 pub const DOCK_SLOT: f32 = 48.0;
 pub const DOCK_SLOT_GAP: f32 = 4.0;
-pub const DOCK_SLOT_RADIUS: f32 = 12.0;
 pub const DOCK_SEPARATOR_HEIGHT: f32 = 32.0;
 pub const DOCK_SEPARATOR_MARGIN: f32 = 6.0;
 pub const DOCK_ICON: f32 = 44.0;
@@ -66,7 +65,6 @@ pub const FLYOUT_W: f32 = 340.0;
 pub const FLYOUT_PAD: f32 = 14.0;
 pub const FLYOUT_GAP: f32 = 8.0;
 pub const FLYOUT_SLIDE: f32 = 8.0;
-pub const MOTION_MS: f32 = 140.0;
 pub const WINDOW_LIST_W: f32 = 320.0;
 
 // Segoe Fluent Icons / Segoe MDL2 Assets code points.
