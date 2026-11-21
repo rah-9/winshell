@@ -17,9 +17,15 @@ path = "src/main.rs"
 [[bin]]
 name = "spike"
 path = "src/bin/spike.rs"
+# Dev tool: build with `cargo build --release --features spike`. Not part of normal builds.
+required-features = ["spike"]
+
+[features]
+spike = []
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62"
+windows-future = "0.3"
 windows-numerics = "0.3"
 
 [target.'cfg(windows)'.dependencies.windows]

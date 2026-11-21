@@ -15,6 +15,9 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+
+use windows_future::{AsyncOperationCompletedHandler, IAsyncOperation};
 
 use windows::Devices::Radios::{Radio, RadioKind, RadioState};
 use windows::Foundation::TypedEventHandler;
@@ -38,6 +41,28 @@ pub const WM_SHELL_MONITOR: u32 = WM_APP + 0x26;
 
 /// Per-app art cache entry: (title, artist, art, tint).
 type ArtEntry = (String, String, Option<Arc<Bgra>>, Option<u32>);
+
+/// Upper bound for any WinRT call made on behalf of another app (a media app that
+/// never completes must not wedge this thread: security review F9).
+const WINRT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Album art larger than this (either side) is not decoded.
+const ART_MAX_SOURCE: u32 = 4096;
+
+/// Wait for a WinRT async operation, at most WINRT_TIMEOUT; cancel it on timeout.
+fn wait<T: windows_core::RuntimeType + 'static>(op: IAsyncOperation<T>) -> Result<T> {
+    let (tx, rx) = mpsc::channel::<()>();
+    op.SetCompleted(&AsyncOperationCompletedHandler::new(move |_, _| {
+        let _ = tx.send(());
+        Ok(())
+    }))?;
+    match rx.recv_timeout(WINRT_TIMEOUT) {
+        Ok(()) => op.GetResults(),
+        Err(_) => {
+            let _ = op.Cancel();
+            Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_ABORT))
+        }
+    }
+}
 
 /// Album art is decoded once at this size; the card (52 px) and the dock pill
 /// (36 px) draw it scaled down, crisp up to 200% display scale.
@@ -196,7 +221,7 @@ impl Worker {
 
     fn setup(&mut self) {
         // Bluetooth radios.
-        match Radio::GetRadiosAsync().and_then(|op| op.join()) {
+        match Radio::GetRadiosAsync().and_then(wait) {
             Ok(list) => {
                 for radio in list {
                     if radio.Kind().ok() != Some(RadioKind::Bluetooth) {
@@ -217,7 +242,7 @@ impl Worker {
         self.send(MonitorEvent::Bluetooth(self.bluetooth()));
 
         // Media sessions.
-        match Manager::RequestAsync().and_then(|op| op.join()) {
+        match Manager::RequestAsync().and_then(wait) {
             Ok(m) => {
                 let a = self.requester(|| Request::Media);
                 let b = self.requester(|| Request::Media);
@@ -296,7 +321,7 @@ impl Worker {
 
     fn snapshot(&mut self, s: &Session, current: Option<&str>) -> Result<MediaSession> {
         let app_id = s.SourceAppUserModelId()?.to_string();
-        let props = s.TryGetMediaPropertiesAsync()?.join()?;
+        let props = wait(s.TryGetMediaPropertiesAsync()?)?;
         let title = props.Title().map(|h| h.to_string()).unwrap_or_default();
         let artist = props.Artist().map(|h| h.to_string()).unwrap_or_default();
         let info = s.GetPlaybackInfo()?;
@@ -330,7 +355,7 @@ impl Worker {
 
     /// Thumbnail stream -> WIC decode -> scale -> premultiplied BGRA.
     fn decode_thumbnail(&mut self, r: &windows::Storage::Streams::IRandomAccessStreamReference) -> Option<Bgra> {
-        let stream = r.OpenReadAsync().ok()?.join().ok()?;
+        let stream = wait(r.OpenReadAsync().ok()?).ok()?;
         unsafe {
             if self.wic.is_none() {
                 self.wic = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok();
@@ -340,6 +365,11 @@ impl Worker {
             let decoder =
                 wic.CreateDecoderFromStream(&istream, std::ptr::null(), WICDecodeMetadataCacheOnDemand).ok()?;
             let frame = decoder.GetFrame(0).ok()?;
+            let (mut w, mut h) = (0u32, 0u32);
+            frame.GetSize(&mut w, &mut h).ok()?;
+            if w == 0 || h == 0 || w > ART_MAX_SOURCE || h > ART_MAX_SOURCE {
+                return None;
+            }
             let scaler = wic.CreateBitmapScaler().ok()?;
             scaler.Initialize(&frame, ART_SIZE, ART_SIZE, WICBitmapInterpolationModeHighQualityCubic).ok()?;
             let conv = wic.CreateFormatConverter().ok()?;
@@ -368,9 +398,9 @@ impl Worker {
             return;
         };
         let r = match cmd {
-            MediaCommand::PlayPause => s.TryTogglePlayPauseAsync().and_then(|o| o.join()),
-            MediaCommand::Next => s.TrySkipNextAsync().and_then(|o| o.join()),
-            MediaCommand::Previous => s.TrySkipPreviousAsync().and_then(|o| o.join()),
+            MediaCommand::PlayPause => s.TryTogglePlayPauseAsync().and_then(wait),
+            MediaCommand::Next => s.TrySkipNextAsync().and_then(wait),
+            MediaCommand::Previous => s.TrySkipPreviousAsync().and_then(wait),
         };
         if let Err(e) = r {
             crate::log!("monitor: media command {cmd:?} failed ({e})");

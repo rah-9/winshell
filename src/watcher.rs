@@ -69,7 +69,11 @@ impl ConfigWatcher {
                             None,
                         )
                     };
-                    if ok.is_err() || st.load(Ordering::SeqCst) {
+                    if st.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Err(e) = ok {
+                        crate::log!("config watcher stopped ({e}); changes now apply on restart");
                         break;
                     }
                     let view = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) };

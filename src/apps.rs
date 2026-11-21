@@ -137,7 +137,8 @@ fn window_aumid(hwnd: HWND) -> Option<String> {
         let p = PropVariantToStringAlloc(&value).ok()?;
         let s = p.to_string().unwrap_or_default();
         CoTaskMemFree(Some(p.0 as _));
-        (!s.is_empty()).then_some(s)
+        // Foreign input: anything outside the allow-list is ignored (grouped by exe instead).
+        crate::util::is_safe_aumid(&s).then_some(s)
     }
 }
 

@@ -75,6 +75,7 @@ pub fn shell_open(target: &str, params: Option<&str>) -> bool {
 /// Launch an app: packaged apps through `shell:AppsFolder\<AUMID>`, others by exe path.
 pub fn launch(exe_path: &str, aumid: Option<&str>) -> bool {
     if let Some(id) = aumid
+        && crate::util::is_safe_aumid(id)
         && shell_open(&format!("shell:AppsFolder\\{id}"), None)
     {
         return true;

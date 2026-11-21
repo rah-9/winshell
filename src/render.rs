@@ -58,6 +58,10 @@ impl Gfx {
 
     /// Premultiplied BGRA pixels -> D2D bitmap on the shared device.
     pub fn bitmap_from_bgra(&self, width: u32, height: u32, pixels: &[u8]) -> Result<ID2D1Bitmap1> {
+        let needed = (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(4));
+        if width == 0 || height == 0 || needed.is_none_or(|n| pixels.len() < n) {
+            return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
+        }
         let props = D2D1_BITMAP_PROPERTIES1 {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,

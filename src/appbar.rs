@@ -228,7 +228,8 @@ pub fn taskbar_state() -> u32 {
 pub fn set_taskbar_state(state: u32) {
     let tray = unsafe { FindWindowW(windows::core::w!("Shell_TrayWnd"), None) }.unwrap_or_default();
     let mut abd = data(tray);
-    abd.lParam = LPARAM(state as isize);
+    // Only the two defined bits; the saved file is user-writable (security review F12).
+    abd.lParam = LPARAM((state & (ABS_AUTOHIDE | ABS_ALWAYSONTOP)) as isize);
     unsafe {
         SHAppBarMessage(ABM_SETSTATE, &mut abd);
     }

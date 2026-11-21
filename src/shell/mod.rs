@@ -74,6 +74,12 @@ const WM_SHELL_RESTORE: u32 = WM_APP + 0x28;
 /// `winshell.exe --quit`: ask the running instance to exit cleanly (restoring the taskbar).
 /// UIPI stops lower-integrity processes from posting WM_APP messages to this window.
 const WM_SHELL_QUIT: u32 = WM_APP + 0x29;
+/// A decoded WM_SETTINGCHANGE (wParam = SETTING_*), posted to ourselves so the
+/// original lParam pointer is never stored or re-posted (security review F1).
+const WM_SHELL_SETTING: u32 = WM_APP + 0x2A;
+const SETTING_INTL: usize = 1;
+const SETTING_COLORS: usize = 2;
+const WM_ENDSESSION_MSG: u32 = 0x0016;
 
 const USAGE: &str = "WinShellTheme (winshell.exe)
 
@@ -214,6 +220,8 @@ pub struct App {
     pub assets: AssetLoader,
     pub icons: Lru<ID2D1Bitmap1>,
     pub icon_requested: HashSet<String>,
+    /// Apps whose icon lookup failed (not retried until a rescan).
+    pub icon_failed: HashSet<String>,
     pub app_names: HashMap<String, String>,
     pub bottom_band: RECT,
     pub span: (i32, i32),
@@ -553,6 +561,7 @@ fn run(mut opts: Options, config: Config, config_path: PathBuf, taskbar: Taskbar
         assets: AssetLoader::start(top_hwnd),
         icons: Lru::new(ICON_CACHE_BYTES),
         icon_requested: HashSet::new(),
+        icon_failed: HashSet::new(),
         app_names: HashMap::new(),
         bottom_band: zero,
         span: (0, 1),
@@ -629,6 +638,7 @@ impl App {
             self.active.icon = self.load_active_icon(self.active.hwnd, self.active.kind);
             self.icons.clear();
             self.icon_requested.clear();
+            self.icon_failed.clear();
             self.sync_assets();
         }
 
@@ -693,6 +703,7 @@ impl App {
         self.active.icon = self.load_active_icon(self.active.hwnd, self.active.kind);
         self.icons.clear();
         self.icon_requested.clear();
+        self.icon_failed.clear();
         self.media_bitmaps.clear();
         self.sync_media_bitmaps();
         self.sync_assets();
@@ -1009,15 +1020,12 @@ fn is_reserve(hwnd: HWND) -> bool {
     h != 0 && (h == TOP_RESERVE_HWND.load(Ordering::Relaxed) || h == BOTTOM_RESERVE_HWND.load(Ordering::Relaxed))
 }
 
-/// WM_SETTINGCHANGE with lParam "intl": regional format changed.
-fn is_intl_change(lp: LPARAM) -> bool {
-    setting_name(lp).eq_ignore_ascii_case("intl")
-}
-
 /// The area name in a WM_SETTINGCHANGE lParam ("intl", "ImmersiveColorSet", ...).
-/// The string comes from the system; it is read up to 64 UTF-16 units at most.
+/// Only called while the message is being *sent* (InSendMessage), when the system
+/// has marshalled the string into this process. A *posted* WM_SETTINGCHANGE can
+/// carry an arbitrary pointer from another process, so it is never dereferenced.
 fn setting_name(lp: LPARAM) -> String {
-    if lp.0 == 0 {
+    if lp.0 == 0 || !unsafe { InSendMessage() }.as_bool() {
         return String::new();
     }
     let p = lp.0 as *const u16;
@@ -1034,6 +1042,24 @@ fn setting_name(lp: LPARAM) -> String {
 
 fn mouse_point(lp: LPARAM) -> (f32, f32) {
     ((lp.0 & 0xFFFF) as i16 as f32, ((lp.0 >> 16) & 0xFFFF) as i16 as f32)
+}
+
+/// Exit now, restoring the taskbar no matter what (security review F3): if the app
+/// state is busy, fall back to the raw cleanup instead of skipping shutdown.
+fn quit_now() {
+    let done = APP.with(|a| match a.try_borrow_mut() {
+        Ok(mut g) => {
+            if let Some(app) = g.as_mut() {
+                app.shutdown();
+            }
+            true
+        }
+        Err(_) => false,
+    });
+    if !done {
+        cleanup_raw();
+    }
+    unsafe { PostQuitMessage(0) };
 }
 
 /// Run a context menu with no app borrow held. Returns the chosen id (0 = none).
@@ -1132,8 +1158,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SHELL_QUIT => {
             log!("quit requested (--quit)");
-            with_app_on_bar(hwnd, msg, wp, lp, |a| a.shutdown());
-            unsafe { PostQuitMessage(0) };
+            quit_now();
+            LRESULT(0)
+        }
+        WM_ENDSESSION_MSG if wp.0 != 0 => {
+            // Logoff / shutdown: restore the taskbar so the user never logs in to a hidden one.
+            log!("session ending");
+            quit_now();
             LRESULT(0)
         }
         WM_SHELL_RESTORE => {
@@ -1148,8 +1179,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_HOTKEY if wp.0 as i32 == hotkey::ID_EMERGENCY => {
             log!("emergency hotkey pressed");
-            with_app(hwnd, msg, wp, lp, |a| a.shutdown());
-            unsafe { PostQuitMessage(0) };
+            quit_now();
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -1309,7 +1339,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_config_changed());
             LRESULT(0)
         }
-        WM_SETTINGCHANGE if setting_name(lp).eq_ignore_ascii_case("ImmersiveColorSet") => {
+        WM_SETTINGCHANGE => {
+            let name = setting_name(lp);
+            let kind = if name.eq_ignore_ascii_case("intl") {
+                SETTING_INTL
+            } else if name.eq_ignore_ascii_case("ImmersiveColorSet") {
+                SETTING_COLORS
+            } else {
+                0
+            };
+            if kind != 0 {
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_SHELL_SETTING, WPARAM(kind), LPARAM(0));
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_SHELL_SETTING if wp.0 == SETTING_COLORS => {
             with_app_on_bar(hwnd, msg, wp, lp, |a| {
                 let g = &a.config.general;
                 if g.follow_windows_theme || g.theme.eq_ignore_ascii_case("auto_system") {
@@ -1319,7 +1365,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             LRESULT(0)
         }
-        WM_SETTINGCHANGE if is_intl_change(lp) => {
+        WM_SHELL_SETTING if wp.0 == SETTING_INTL => {
             with_app_on_bar(hwnd, msg, wp, lp, |a| {
                 a.clock_text.clear(); // force a redraw in the new format
                 a.refresh_clock();

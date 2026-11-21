@@ -261,7 +261,17 @@ pub fn parse(text: &str, base: Palette) -> (Palette, Vec<String>) {
 /// Theme names map to file names, so only `[A-Za-z0-9_-]` is accepted
 /// (no path separators, dots or drive letters: no path traversal).
 pub fn valid_theme_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && !is_reserved_device_name(name)
+}
+
+/// CON, PRN, AUX, NUL, COM1-9, LPT1-9 (any case) open devices, not files.
+fn is_reserved_device_name(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    matches!(n.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((n.starts_with("COM") || n.starts_with("LPT")) && n.len() == 4 && n.as_bytes()[3].is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -315,7 +325,9 @@ mod tests {
     fn theme_names_cannot_escape_the_folder() {
         assert!(valid_theme_name("dark_glass"));
         assert!(valid_theme_name("My-Theme2"));
-        for bad in ["", "..", "../x", "a/b", "a\\b", "C:x", "x.toml", "a b", &"x".repeat(65)] {
+        for bad in
+            ["", "..", "../x", "a/b", "a\\b", "C:x", "x.toml", "a b", &"x".repeat(65), "CON", "nul", "Com1", "lpt9"]
+        {
             assert!(!valid_theme_name(bad), "{bad}");
         }
     }

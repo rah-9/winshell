@@ -124,6 +124,7 @@ impl App {
 
     /// Full window rescan. Only on startup, resume, display change and Explorer restart.
     pub fn rescan(&mut self, why: &str) {
+        self.icon_failed.clear();
         self.dock_model.replace_all(apps::enumerate());
         let fg = unsafe { GetForegroundWindow() };
         if !App::foreground_is_ours(fg) {
@@ -195,7 +196,8 @@ impl App {
         let size = self.icon_fetch_size();
         let mut wanted = Vec::new();
         for g in self.dock_model.groups() {
-            if !self.icons.contains(&g.id) && !self.icon_requested.contains(&g.id) {
+            if !self.icons.contains(&g.id) && !self.icon_requested.contains(&g.id) && !self.icon_failed.contains(&g.id)
+            {
                 wanted.push(AssetRequest {
                     app_id: g.id.clone(),
                     aumid: g.aumid.clone(),
@@ -224,6 +226,12 @@ impl App {
         for r in self.assets.drain() {
             self.icon_requested.remove(&r.app_id);
             if !r.display_name.is_empty() {
+                if self.app_names.len() >= 512 {
+                    // Bounded: keep only names of apps currently in the dock.
+                    let live: std::collections::HashSet<&str> =
+                        self.dock_model.groups().iter().map(|g| g.id.as_str()).collect();
+                    self.app_names.retain(|k, _| live.contains(k.as_str()));
+                }
                 self.app_names.insert(r.app_id.clone(), r.display_name.clone());
                 if let Some(g) = self.dock_model.group_mut(&r.app_id) {
                     g.display_name = r.display_name.clone();
@@ -240,7 +248,13 @@ impl App {
                         log!("icon cache evicted {evicted}");
                     }
                 }
-                None => log!("no icon for {}", r.app_id),
+                None => {
+                    // Negative cache: do not ask the shell again until the next rescan.
+                    if self.icon_failed.len() < 1024 {
+                        self.icon_failed.insert(r.app_id.clone());
+                    }
+                    log!("no icon for {}", r.app_id);
+                }
             }
             redraw |= self.dock_model.groups().iter().any(|g| g.id == r.app_id);
         }
@@ -315,16 +329,19 @@ impl App {
         let s = self.scale();
         let avail = (self.span.1 - self.span.0 - 2 * px(BAR_MARGIN, s)) as f32;
         let n = self.dock_model.groups().len();
-        for k in (0..=n).rev() {
-            let l = self.build_dock_layout(k);
-            if l.width <= avail {
-                if k < n {
-                    log!("dock: {} of {n} apps fit", k);
-                }
-                return l;
-            }
+        let full = self.build_dock_layout(n);
+        if full.width <= avail {
+            return full;
         }
-        self.build_dock_layout(0)
+        // Width grows with the number of apps: binary-search the largest count that fits
+        // (O(n log n), so a process spawning many windows cannot stall the UI: review F7).
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if self.build_dock_layout(mid).width <= avail { lo = mid } else { hi = mid - 1 }
+        }
+        log!("dock: {lo} of {n} apps fit");
+        self.build_dock_layout(lo)
     }
 
     /// The dock window resizes as apps come and go; the reservation never does.

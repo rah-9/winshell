@@ -42,6 +42,17 @@ pub fn all_alpha_zero(px: &[u8]) -> bool {
     px.chunks_exact(4).all(|p| p[3] == 0)
 }
 
+/// Strict allow-list for AUMIDs before they reach the shell namespace parser
+/// (`shell:AppsFolder\<AUMID>`). Another process can set any string as its window's
+/// AUMID, so path separators, colons, `%`, quotes, spaces, control characters and
+/// `..` are rejected (security review F6). Real AUMIDs look like
+/// `Microsoft.WindowsTerminal_8wekyb3d8bbwe!App`, `Chrome`, `MSEdge`.
+pub fn is_safe_aumid(s: &str) -> bool {
+    (1..=256).contains(&s.len())
+        && !s.contains("..")
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '!' | '+' | '{' | '}'))
+}
+
 /// Normalise 32-bit BGRA from a shell/GDI bitmap to premultiplied alpha:
 /// * no alpha channel at all (every alpha 0) -> fully opaque;
 /// * straight alpha (some colour channel exceeds its alpha) -> premultiply;
@@ -220,6 +231,29 @@ mod tests {
         for len in 0..=a.len() + 8 {
             let _ = buffer_has_relevant(&a, len);
         }
+    }
+
+    #[test]
+    fn aumid_allow_list() {
+        for ok in ["Microsoft.WindowsTerminal_8wekyb3d8bbwe!App", "Chrome", "MSEdge", "Spotify.Spotify", "Foo+Bar-1"] {
+            assert!(is_safe_aumid(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\cmd.exe",
+            "..\\..\\x",
+            "a/b",
+            "C:x",
+            "http://x",
+            "%TEMP%",
+            "a b",
+            "a\"b",
+            "a..b",
+            "x\n",
+        ] {
+            assert!(!is_safe_aumid(bad), "{bad:?}");
+        }
+        assert!(!is_safe_aumid(&"a".repeat(257)));
     }
 
     #[test]

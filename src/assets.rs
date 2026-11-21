@@ -19,7 +19,7 @@ use windows::Win32::UI::Shell::{
     IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY, SIIGBF_ICONONLY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
-use windows::core::{HSTRING, Interface, PCWSTR, w};
+use windows::core::{HSTRING, Interface, w};
 
 use crate::icon::{self, Bgra};
 
@@ -92,7 +92,7 @@ fn load(req: &AssetRequest) -> AssetResult {
     let mut display_name = String::new();
     let mut icon = None;
 
-    if let Some(aumid) = &req.aumid
+    if let Some(aumid) = req.aumid.as_deref().filter(|a| crate::util::is_safe_aumid(a))
         && let Some(item) = shell_item(&format!("shell:AppsFolder\\{aumid}"))
     {
         display_name = item_name(&item).unwrap_or_default();
@@ -153,13 +153,32 @@ fn file_description(exe: &str) -> Option<String> {
         if VerQueryValueW(data.as_ptr() as _, w!("\\VarFileInfo\\Translation"), &mut ptr, &mut len).as_bool()
             && len >= 4
         {
-            let t = std::slice::from_raw_parts(ptr as *const u16, 2);
-            lang_cp.insert(0, format!("{:04x}{:04x}", t[0], t[1]));
+            // The block may not be 2-byte aligned: read without assuming alignment.
+            let lang = std::ptr::read_unaligned(ptr as *const u16);
+            let cp = std::ptr::read_unaligned((ptr as *const u16).add(1));
+            lang_cp.insert(0, format!("{lang:04x}{cp:04x}"));
         }
         for lc in lang_cp {
             let key = HSTRING::from(format!("\\StringFileInfo\\{lc}\\FileDescription"));
             if VerQueryValueW(data.as_ptr() as _, &key, &mut ptr, &mut len).as_bool() && len > 1 {
-                let s = PCWSTR(ptr as *const u16).to_string().unwrap_or_default();
+                // `len` is in characters. Never scan past it or past the version block
+                // (a crafted exe may omit the terminator: security review F5).
+                let base = data.as_ptr() as usize;
+                let start = ptr as usize;
+                if start < base || start >= base + data.len() {
+                    continue;
+                }
+                let max_units = (base + data.len() - start) / 2;
+                let units = (len as usize).min(max_units).min(256);
+                let mut text = Vec::with_capacity(units);
+                for i in 0..units {
+                    let c = std::ptr::read_unaligned((ptr as *const u16).add(i));
+                    if c == 0 {
+                        break;
+                    }
+                    text.push(c);
+                }
+                let s = String::from_utf16_lossy(&text);
                 let s = s.trim().to_string();
                 if !s.is_empty() {
                     return Some(s);
