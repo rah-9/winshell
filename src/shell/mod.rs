@@ -13,6 +13,7 @@
 //! Threads: this UI thread (STA), the shell asset loader (STA) and the system
 //! monitor (MTA, WinRT). Workers report through channels + PostMessageW.
 
+mod autohide;
 mod bar;
 mod dock;
 mod panel;
@@ -68,6 +69,8 @@ const FLYOUT_CLASS: PCWSTR = w!("WinShellTheme_FlyoutClass");
 
 const TIMER_CLOCK: usize = 1;
 const TIMER_TOOLTIP_HIDE: usize = 2;
+const TIMER_AUTOHIDE_BAR: usize = 3;
+const TIMER_AUTOHIDE_DOCK: usize = 4;
 
 /// Second launch: ask the running instance to show its windows again.
 const WM_SHELL_RESTORE: u32 = WM_APP + 0x28;
@@ -239,6 +242,13 @@ pub struct App {
     pub power_notify: PowerNotifications,
     pub sysmon: SystemMonitor,
     pub bluetooth: Option<bool>,
+    pub wifi_radio: Option<bool>,
+    pub wifi_networks: Vec<winshell::network::WifiNetwork>,
+    pub bt_devices: Vec<winshell::sysmon::BtDevice>,
+    // Auto-hide
+    pub edges: autohide::Edges,
+    pub reveal_bar: bool,
+    pub reveal_dock: bool,
     // M7
     pub media: Vec<MediaSession>,
     pub media_bitmaps: HashMap<String, (usize, ID2D1Bitmap1)>,
@@ -520,10 +530,8 @@ fn run(mut opts: Options, config: Config, config_path: PathBuf, taskbar: Taskbar
         win::create_popup(WINDOW_CLASS, w!("WinShellTheme BottomReserve"), opts.reserve.ex_style(), zero)?;
     TOP_RESERVE_HWND.store(top_res_hwnd.0 as isize, Ordering::SeqCst);
     BOTTOM_RESERVE_HWND.store(bot_res_hwnd.0 as isize, Ordering::SeqCst);
-    let mut top_reserve = AppBar::new(top_res_hwnd, Edge::Top);
-    let mut bottom_reserve = AppBar::new(bot_res_hwnd, Edge::Bottom);
-    top_reserve.register();
-    bottom_reserve.register();
+    let top_reserve = AppBar::new(top_res_hwnd, Edge::Top);
+    let bottom_reserve = AppBar::new(bot_res_hwnd, Edge::Bottom);
 
     let monitor = MonitorGeometry::primary();
     let fonts = make_fonts(&gfx, monitor.scale())?;
@@ -577,6 +585,12 @@ fn run(mut opts: Options, config: Config, config_path: PathBuf, taskbar: Taskbar
         power_notify: PowerNotifications::register(top_hwnd),
         sysmon: SystemMonitor::start(top_hwnd),
         bluetooth: None,
+        wifi_radio: None,
+        wifi_networks: Vec::new(),
+        bt_devices: Vec::new(),
+        edges: autohide::Edges::create()?,
+        reveal_bar: false,
+        reveal_dock: false,
         media: Vec::new(),
         media_bitmaps: HashMap::new(),
         devices: Vec::new(),
@@ -589,14 +603,15 @@ fn run(mut opts: Options, config: Config, config_path: PathBuf, taskbar: Taskbar
         log!("config watcher unavailable; changes apply on restart");
     }
     app.net_state = app.network.state();
+    app.sync_reservations();
+    app.log_autohide();
     app.load_pins();
     app.rescan("startup");
     app.layout();
     app.opts.reserve.finish(top_res_hwnd);
     app.opts.reserve.finish(bot_res_hwnd);
     app.update_active(unsafe { GetForegroundWindow() });
-    app.top_bar.show(false);
-    app.dock.show(false);
+    app.update_visibility();
     app.redraw_all();
     app.clock.arm();
     app.refresh_clock(); // the minute may have turned since clock_text was built
@@ -654,6 +669,7 @@ impl App {
 
         self.bottom_band = bottom;
         self.span = (left, right);
+        self.place_edges();
         log!(
             "layout: dpi {} top reserve {} bottom reserve {} bar {}",
             self.monitor.dpi,
@@ -734,14 +750,10 @@ impl App {
         }
         self.fullscreen = on;
         if on {
-            self.top_bar.hide();
-            self.dock.hide();
             self.tooltip.hide();
             self.close_panel();
-        } else {
-            self.top_bar.show(false);
-            self.dock.show(false);
         }
+        self.update_visibility();
         log!(
             "fullscreen app {}: bar and dock {}",
             if on { "opened" } else { "closed" },
@@ -752,12 +764,12 @@ impl App {
     fn on_appbar(&mut self, from: HWND, wp: WPARAM, lp: LPARAM) {
         log!("appbar: {}", appbar::describe_notification(wp.0, lp));
         match wp.0 as u32 {
-            ABN_POSCHANGED if from == self.top_reserve.hwnd => {
+            ABN_POSCHANGED if from == self.primary_reserve() => {
                 self.layout();
                 self.redraw_all();
             }
             // Both reservations get this; only act on the top one to avoid doing it twice.
-            ABN_FULLSCREENAPP if from == self.top_reserve.hwnd => self.set_fullscreen(lp.0 != 0),
+            ABN_FULLSCREENAPP if from == self.primary_reserve() => self.set_fullscreen(lp.0 != 0),
             _ => {}
         }
     }
@@ -767,8 +779,7 @@ impl App {
         log!("Explorer restarted; re-registering AppBars");
         self.top_reserve.registered = false;
         self.bottom_reserve.registered = false;
-        self.top_reserve.register();
-        self.bottom_reserve.register();
+        self.sync_reservations();
         self.rescan("Explorer restart");
         self.layout();
         self.redraw_all();
@@ -812,6 +823,15 @@ impl App {
             self.net_state = s;
             self.redraw_bar(None);
         }
+        if self.panel_is(panel::PanelKind::Wifi) {
+            self.wifi_networks = self.network.available_networks();
+            self.refresh_panel_if(panel::PanelKind::Wifi);
+        }
+    }
+
+    /// The reservation whose ABN_* notifications we act on (both get them).
+    fn primary_reserve(&self) -> HWND {
+        if self.top_reserve.registered { self.top_reserve.hwnd } else { self.bottom_reserve.hwnd }
     }
 
     fn on_power_change(&mut self) {
@@ -828,11 +848,24 @@ impl App {
         let mut media = false;
         for ev in self.sysmon.drain() {
             match ev {
-                winshell::sysmon::MonitorEvent::Bluetooth(b) => {
-                    if b != self.bluetooth {
-                        self.bluetooth = b;
+                winshell::sysmon::MonitorEvent::Radios { bluetooth, wifi } => {
+                    if bluetooth != self.bluetooth || wifi != self.wifi_radio {
+                        self.bluetooth = bluetooth;
+                        self.wifi_radio = wifi;
                         bar = true;
+                        if self.panel_is(panel::PanelKind::Wifi) {
+                            self.wifi_networks = self.network.available_networks();
+                        }
+                        self.refresh_panel_if(panel::PanelKind::Wifi);
+                        if self.panel_is(panel::PanelKind::Bluetooth) {
+                            self.sysmon.refresh_bt_devices();
+                        }
+                        self.refresh_panel_if(panel::PanelKind::Bluetooth);
                     }
+                }
+                winshell::sysmon::MonitorEvent::BluetoothDevices(d) => {
+                    self.bt_devices = d;
+                    self.refresh_panel_if(panel::PanelKind::Bluetooth);
                 }
                 winshell::sysmon::MonitorEvent::Media(m) => {
                     self.media = m;
@@ -909,6 +942,8 @@ impl App {
         if pins_changed {
             self.load_pins();
         }
+        self.sync_reservations();
+        self.log_autohide();
         if autohide_changed && !self.opts.keep_taskbar {
             if self.config.taskbar.autohide_native {
                 self.taskbar.enable_autohide();
@@ -966,6 +1001,7 @@ impl App {
         for p in [&self.flyout, &self.tooltip, &self.dock, &self.top_bar] {
             p.destroy();
         }
+        self.edges.destroy();
         for h in [self.top_reserve.hwnd, self.bottom_reserve.hwnd] {
             unsafe {
                 let _ = DestroyWindow(h);
@@ -1182,6 +1218,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             quit_now();
             LRESULT(0)
         }
+        WM_MOUSEMOVE
+            if APP.with(|a| {
+                a.try_borrow().ok().and_then(|g| g.as_ref().and_then(|app| app.edges.is_edge(hwnd))).is_some()
+            }) =>
+        {
+            with_app(hwnd, msg, wp, lp, |a| {
+                if let Some(top) = a.edges.is_edge(hwnd) {
+                    a.on_edge_hover(top);
+                }
+            });
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             let (x, y) = mouse_point(lp);
             with_app(hwnd, msg, wp, lp, |a| {
@@ -1209,10 +1257,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Surface::Bar => {
                     a.top_bar.tracking_leave = false;
                     a.bar_mouse_move(-1.0, -1.0);
+                    a.on_surface_left(true);
                 }
                 Surface::Dock => {
                     a.dock.tracking_leave = false;
                     a.dock_mouse_move(-1.0, -1.0);
+                    a.on_surface_left(false);
                 }
                 Surface::Flyout => {
                     a.flyout.tracking_leave = false;
@@ -1293,6 +1343,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER => {
             match wp.0 {
                 TIMER_CLOCK => with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_clock_timer()),
+                TIMER_AUTOHIDE_BAR | TIMER_AUTOHIDE_DOCK => {
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), wp.0);
+                    }
+                    with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_autohide_timer(wp.0));
+                }
                 TIMER_TOOLTIP_HIDE => {
                     unsafe {
                         let _ = KillTimer(Some(hwnd), TIMER_TOOLTIP_HIDE);
@@ -1305,6 +1361,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SHELL_FOREGROUND => {
             with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_foreground());
+            LRESULT(0)
+        }
+        winshell::foreground::WM_SHELL_FGMOVE => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| {
+                a.tracker.ack_move();
+                a.update_visibility();
+            });
             LRESULT(0)
         }
         WM_SHELL_TITLE => {

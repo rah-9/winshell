@@ -84,9 +84,24 @@ pub struct MediaSession {
     pub tint: Option<u32>,
 }
 
+/// A paired Bluetooth device for the flyout (name only; never executed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtDevice {
+    pub name: String,
+    pub connected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RadioSel {
+    Bluetooth,
+    Wifi,
+}
+
 pub enum MonitorEvent {
-    /// `None` = no Bluetooth radio (hide the pill).
-    Bluetooth(Option<bool>),
+    /// Radio states. `None` = no such radio (Bluetooth: hide the pill).
+    Radios { bluetooth: Option<bool>, wifi: Option<bool> },
+    /// Paired Bluetooth devices (sent when the Bluetooth flyout asks).
+    BluetoothDevices(Vec<BtDevice>),
     /// All sessions; the current one first.
     Media(Vec<MediaSession>),
 }
@@ -102,6 +117,8 @@ enum Request {
     Bluetooth,
     Media,
     Command(String, MediaCommand),
+    SetRadio(RadioSel, bool),
+    BtDevices,
 }
 
 pub struct SystemMonitor {
@@ -125,16 +142,25 @@ impl SystemMonitor {
                 // Coalesce bursts (media apps fire several events per track change).
                 let mut reqs = vec![first];
                 reqs.extend(req_rx.try_iter());
-                let (mut bt, mut media) = (false, false);
+                let (mut bt, mut media, mut devices) = (false, false, false);
                 for r in reqs {
                     match r {
                         Request::Bluetooth => bt = true,
                         Request::Media => media = true,
                         Request::Command(app, cmd) => w.command(&app, cmd),
+                        Request::SetRadio(sel, on) => {
+                            w.set_radio(sel, on);
+                            bt = true;
+                        }
+                        Request::BtDevices => devices = true,
                     }
                 }
                 if bt {
-                    w.send(MonitorEvent::Bluetooth(w.bluetooth()));
+                    w.send(w.radios_event());
+                }
+                if devices {
+                    let list = w.bt_devices();
+                    w.send(MonitorEvent::BluetoothDevices(list));
                 }
                 if media {
                     w.resubscribe_sessions();
@@ -158,6 +184,20 @@ impl SystemMonitor {
     pub fn media_command(&self, app_id: &str, cmd: MediaCommand) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Request::Command(app_id.to_string(), cmd));
+        }
+    }
+
+    /// Turn the Bluetooth or Wi-Fi radio on/off (like the native quick settings toggle).
+    pub fn set_radio(&self, sel: RadioSel, on: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Request::SetRadio(sel, on));
+        }
+    }
+
+    /// Ask for the paired Bluetooth device list.
+    pub fn refresh_bt_devices(&self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Request::BtDevices);
         }
     }
 
@@ -220,11 +260,12 @@ impl Worker {
     }
 
     fn setup(&mut self) {
-        // Bluetooth radios.
+        // Bluetooth and Wi-Fi radios.
         match Radio::GetRadiosAsync().and_then(wait) {
             Ok(list) => {
                 for radio in list {
-                    if radio.Kind().ok() != Some(RadioKind::Bluetooth) {
+                    let kind = radio.Kind().ok();
+                    if kind != Some(RadioKind::Bluetooth) && kind != Some(RadioKind::WiFi) {
                         continue;
                     }
                     let fire = self.requester(|| Request::Bluetooth);
@@ -239,7 +280,7 @@ impl Worker {
             }
             Err(e) => crate::log!("monitor: radios unavailable ({e})"),
         }
-        self.send(MonitorEvent::Bluetooth(self.bluetooth()));
+        self.send(self.radios_event());
 
         // Media sessions.
         match Manager::RequestAsync().and_then(wait) {
@@ -263,11 +304,63 @@ impl Worker {
         self.send(MonitorEvent::Media(snapshot));
     }
 
-    fn bluetooth(&self) -> Option<bool> {
-        if self.radios.is_empty() {
+    fn radio_state(&self, kind: RadioKind) -> Option<bool> {
+        let of_kind: Vec<&Radio> = self.radios.iter().map(|(r, _)| r).filter(|r| r.Kind().ok() == Some(kind)).collect();
+        if of_kind.is_empty() {
             return None;
         }
-        Some(self.radios.iter().any(|(r, _)| r.State().ok() == Some(RadioState::On)))
+        Some(of_kind.iter().any(|r| r.State().ok() == Some(RadioState::On)))
+    }
+
+    fn radios_event(&self) -> MonitorEvent {
+        MonitorEvent::Radios {
+            bluetooth: self.radio_state(RadioKind::Bluetooth),
+            wifi: self.radio_state(RadioKind::WiFi),
+        }
+    }
+
+    fn set_radio(&self, sel: RadioSel, on: bool) {
+        let kind = match sel {
+            RadioSel::Bluetooth => RadioKind::Bluetooth,
+            RadioSel::Wifi => RadioKind::WiFi,
+        };
+        match Radio::RequestAccessAsync().and_then(wait) {
+            Ok(windows::Devices::Radios::RadioAccessStatus::Allowed) => {}
+            other => {
+                crate::log!("monitor: radio access not allowed ({other:?})");
+                return;
+            }
+        }
+        let state = if on { RadioState::On } else { RadioState::Off };
+        for (r, _) in self.radios.iter().filter(|(r, _)| r.Kind().ok() == Some(kind)) {
+            if let Err(e) = r.SetStateAsync(state).and_then(wait) {
+                crate::log!("monitor: radio switch failed ({e})");
+            }
+        }
+    }
+
+    /// Paired (classic) Bluetooth devices with their connection state.
+    fn bt_devices(&self) -> Vec<BtDevice> {
+        use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothDevice};
+        use windows::Devices::Enumeration::DeviceInformation;
+        let Ok(selector) = BluetoothDevice::GetDeviceSelectorFromPairingState(true) else { return Vec::new() };
+        let Ok(found) = DeviceInformation::FindAllAsyncAqsFilter(&selector).and_then(wait) else { return Vec::new() };
+        let mut out = Vec::new();
+        for info in found.into_iter().take(16) {
+            let name = info.Name().map(|h| h.to_string()).unwrap_or_default();
+            let connected = info
+                .Id()
+                .and_then(|id| BluetoothDevice::FromIdAsync(&id))
+                .and_then(wait)
+                .and_then(|d| d.ConnectionStatus())
+                .map(|s| s == BluetoothConnectionStatus::Connected)
+                .unwrap_or(false);
+            if !name.trim().is_empty() {
+                out.push(BtDevice { name, connected });
+            }
+        }
+        out.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+        out
     }
 
     /// Re-attach property/playback handlers to the current set of sessions.

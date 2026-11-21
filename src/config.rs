@@ -28,6 +28,9 @@ pub struct General {
 #[serde(default)]
 pub struct TopBar {
     pub enabled_pills: Vec<String>,
+    /// Hide when an app is maximised or overlaps the bar; push the mouse to the top
+    /// edge to bring it back. Apps then get the full screen (no reserved space).
+    pub autohide: bool,
 }
 
 impl Default for TopBar {
@@ -36,6 +39,7 @@ impl Default for TopBar {
             enabled_pills: ["bluetooth", "wifi", "volume", "battery", "clock", "notifications", "quick_settings"]
                 .map(String::from)
                 .to_vec(),
+            autohide: true,
         }
     }
 }
@@ -46,13 +50,22 @@ impl TopBar {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Dock {
     /// Hovered icon drawn at 1.15x.
     pub magnification: bool,
     /// Exe paths (absolute, or a bare name found on PATH) or AUMIDs.
     pub pinned_apps: Vec<String>,
+    /// Hide when an app is maximised or overlaps the dock; push the mouse to the
+    /// bottom edge to bring it back. Apps then get the full screen.
+    pub autohide: bool,
+}
+
+impl Default for Dock {
+    fn default() -> Self {
+        Self { magnification: false, pinned_apps: Vec::new(), autohide: true }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -79,9 +92,11 @@ follow_windows_theme = false     # true = follow Windows light/dark mode
 
 [top_bar]
 enabled_pills = ["bluetooth", "wifi", "volume", "battery", "clock", "notifications", "quick_settings"]
+autohide = true                  # hide over maximised apps; mouse to the top edge shows it
 
 [dock]
 magnification = false            # draw the hovered icon at 1.15x
+autohide = true                  # hide over maximised apps; mouse to the bottom edge shows it
 # Exe paths, bare exe names on PATH, or AUMIDs (packaged apps).
 # Right-click a dock icon > Pin to Dock to add entries here.
 pinned_apps = [
@@ -160,6 +175,7 @@ mod tests {
         assert!(c.taskbar.autohide_native);
         assert!(!c.dock.magnification);
         assert!(c.top_bar.pill_enabled("WiFi"));
+        assert!(c.top_bar.autohide && c.dock.autohide);
     }
 
     #[test]

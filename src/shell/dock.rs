@@ -153,6 +153,11 @@ impl App {
 
     /// Queued window events: re-evaluate only the windows that changed.
     pub fn on_window_events(&mut self) {
+        self.on_window_events_inner();
+        self.update_visibility();
+    }
+
+    fn on_window_events_inner(&mut self) {
         let mut changed = false;
         for p in self.window_hooks.take_pending() {
             if p.destroyed {

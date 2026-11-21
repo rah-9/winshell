@@ -218,6 +218,7 @@ impl App {
             self.redraw_bar(None);
         }
         self.dock_on_foreground(fg);
+        self.update_visibility();
     }
 
     pub fn on_title(&mut self) {
@@ -502,20 +503,11 @@ impl App {
             PillKind::Volume => self.toggle_panel(PanelKind::Sound),
             PillKind::Battery => self.toggle_panel(PanelKind::Battery),
             PillKind::Clock => self.toggle_panel(PanelKind::Calendar),
+            PillKind::Wifi => self.toggle_panel(PanelKind::Wifi),
+            PillKind::Bluetooth => self.toggle_panel(PanelKind::Bluetooth),
             other => {
                 self.close_panel();
                 match other {
-                    PillKind::Wifi => {
-                        let uri = if self.net_state == NetState::Ethernet {
-                            "ms-settings:network-ethernet"
-                        } else {
-                            "ms-settings:network-wifi"
-                        };
-                        actions::shell_open(uri, None);
-                    }
-                    PillKind::Bluetooth => {
-                        actions::shell_open("ms-settings:bluetooth", None);
-                    }
                     PillKind::Notifications => actions::open_notifications(),
                     PillKind::QuickSettings => actions::open_quick_settings(),
                     _ => {}

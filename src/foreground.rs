@@ -17,16 +17,23 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_SHELL_FOREGROUND: u32 = WM_APP + 0x20;
 pub const WM_SHELL_TITLE: u32 = WM_APP + 0x21;
+/// The foreground window moved or resized (only while auto-hide needs it).
+pub const WM_SHELL_FGMOVE: u32 = WM_APP + 0x2B;
 
 static POST_TO: AtomicIsize = AtomicIsize::new(0);
 static TRACKED: AtomicIsize = AtomicIsize::new(0);
 static FOREGROUND_PENDING: AtomicBool = AtomicBool::new(false);
 static TITLE_PENDING: AtomicBool = AtomicBool::new(false);
+static MOVE_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub struct ForegroundTracker {
     foreground_hook: HWINEVENTHOOK,
     name_hook: HWINEVENTHOOK,
     name_pid: u32,
+    /// EVENT_OBJECT_LOCATIONCHANGE, scoped to the foreground process, only while
+    /// auto-hide is on (PLAN.md section 4): moves elsewhere never wake us.
+    move_hook: HWINEVENTHOOK,
+    pub track_moves: bool,
 }
 
 impl ForegroundTracker {
@@ -47,12 +54,22 @@ impl ForegroundTracker {
         if foreground_hook.is_invalid() {
             crate::log!("WARNING: EVENT_SYSTEM_FOREGROUND hook failed; active window will not update");
         }
-        Self { foreground_hook, name_hook: HWINEVENTHOOK::default(), name_pid: 0 }
+        Self {
+            foreground_hook,
+            name_hook: HWINEVENTHOOK::default(),
+            name_pid: 0,
+            move_hook: HWINEVENTHOOK::default(),
+            track_moves: false,
+        }
     }
 
     /// Clear the coalescing flag. Call at the start of the WM_SHELL_FOREGROUND handler.
     pub fn ack_foreground(&self) {
         FOREGROUND_PENDING.store(false, Ordering::SeqCst);
+    }
+
+    pub fn ack_move(&self) {
+        MOVE_PENDING.store(false, Ordering::SeqCst);
     }
 
     /// Clear the coalescing flag. Call at the start of the WM_SHELL_TITLE handler.
@@ -67,12 +84,26 @@ impl ForegroundTracker {
         unsafe {
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
         }
-        if pid == self.name_pid && !self.name_hook.is_invalid() {
+        let moves_ok = !self.track_moves || !self.move_hook.is_invalid();
+        if pid == self.name_pid && !self.name_hook.is_invalid() && moves_ok {
             return;
         }
         self.unhook_name();
         if pid == 0 {
             return;
+        }
+        if self.track_moves {
+            self.move_hook = unsafe {
+                SetWinEventHook(
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    None,
+                    Some(on_event),
+                    pid,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
         }
         self.name_hook = unsafe {
             SetWinEventHook(
@@ -89,6 +120,12 @@ impl ForegroundTracker {
     }
 
     fn unhook_name(&mut self) {
+        if !self.move_hook.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(self.move_hook);
+            }
+            self.move_hook = HWINEVENTHOOK::default();
+        }
         if !self.name_hook.is_invalid() {
             unsafe {
                 let _ = UnhookWinEvent(self.name_hook);
@@ -139,6 +176,13 @@ unsafe extern "system" fn on_event(
 ) {
     match event {
         EVENT_SYSTEM_FOREGROUND => post(&FOREGROUND_PENDING, WM_SHELL_FOREGROUND),
+        EVENT_OBJECT_LOCATIONCHANGE
+            if id_object == OBJID_WINDOW.0
+                && id_child == CHILDID_SELF as i32
+                && hwnd.0 as isize == TRACKED.load(Ordering::Relaxed) =>
+        {
+            post(&MOVE_PENDING, WM_SHELL_FGMOVE)
+        }
         EVENT_OBJECT_NAMECHANGE
             if id_object == OBJID_WINDOW.0
                 && id_child == CHILDID_SELF as i32
@@ -171,6 +215,9 @@ pub fn classify(hwnd: HWND) -> Kind {
     if pid == unsafe { GetCurrentProcessId() } {
         return Kind::Ignore;
     }
+    if is_shell_host(pid) {
+        return Kind::Ignore;
+    }
     match class_name(hwnd).as_str() {
         "Progman" | "WorkerW" => Kind::Desktop,
         "Shell_TrayWnd"
@@ -180,6 +227,39 @@ pub fn classify(hwnd: HWND) -> Kind {
         | "XamlExplorerHostIslandWindow"
         | "ForegroundStaging" => Kind::Ignore,
         _ => Kind::App,
+    }
+}
+
+/// Start, Search, the notification centre, the touch keyboard and similar shell
+/// surfaces are separate processes; the bar must not show them as "apps".
+fn is_shell_host(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+    const HOSTS: [&str; 8] = [
+        "searchhost.exe",
+        "searchapp.exe",
+        "startmenuexperiencehost.exe",
+        "shellexperiencehost.exe",
+        "shellhost.exe",
+        "textinputhost.exe",
+        "lockapp.exe",
+        "searchui.exe",
+    ];
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return false };
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok =
+            QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(h);
+        if !ok {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase();
+        let name = path.rsplit('\\').next().unwrap_or("");
+        HOSTS.contains(&name)
     }
 }
 

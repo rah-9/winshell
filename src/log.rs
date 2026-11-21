@@ -55,9 +55,10 @@ pub fn write_line(msg: &str) {
         Err(p) => p.into_inner(),
     };
     if let Some(path) = guard.as_ref()
-        && fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
-            let _ = fs::rename(path, path.with_extension("log.old"));
-        }
+        && fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false)
+    {
+        let _ = fs::rename(path, path.with_extension("log.old"));
+    }
     if let Some(path) = guard.as_ref()
         && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
     {

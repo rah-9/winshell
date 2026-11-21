@@ -16,8 +16,9 @@ use windows::core::Result;
 use winshell::actions;
 use winshell::calendar;
 use winshell::clock;
+use winshell::log;
 use winshell::render::{self, rectf};
-use winshell::sysmon::MediaCommand;
+use winshell::sysmon::{MediaCommand, RadioSel};
 use winshell::util::darken;
 use winshell::win::{self, px};
 
@@ -33,6 +34,8 @@ pub enum PanelKind {
     Sound,
     Battery,
     Calendar,
+    Wifi,
+    Bluetooth,
     /// Window list for the dock group with this id.
     WindowList(String),
 }
@@ -56,6 +59,13 @@ enum PanelHit {
     CalPrev,
     CalNext,
     CalToday,
+    /// Turn a radio on (true) or off.
+    Radio(RadioSel, bool),
+    /// Connect to a saved Wi-Fi profile.
+    WifiConnect(String),
+    WifiDisconnect,
+    /// A network Windows has no profile for: the native picker asks for the password.
+    WifiPicker,
 }
 
 #[derive(Clone, Copy)]
@@ -131,6 +141,34 @@ impl Builder {
         self.text(t, Font::Header, rectf(l, self.y, r - l, 24.0 * s), pal().text_primary, Align::Leading);
         self.y += 24.0 * s + 8.0 * s;
     }
+    /// Header with an on/off switch at the right (like the native quick settings tiles).
+    fn header_toggle(&mut self, t: &str, state: Option<bool>, sel: RadioSel) {
+        let (l, r) = self.inner();
+        let s = self.s;
+        let y = self.y;
+        self.text(t, Font::Header, rectf(l, y, r - l - 56.0 * s, 24.0 * s), pal().text_primary, Align::Leading);
+        if let Some(on) = state {
+            let (w, h) = (40.0 * s, 20.0 * s);
+            let track = rectf(r - w, y + 2.0 * s, w, h);
+            self.fill(track, h / 2.0, if on { pal().accent } else { pal().slider_track });
+            let k = h - 6.0 * s;
+            let kx = if on { track.right - 3.0 * s - k } else { track.left + 3.0 * s };
+            self.fill(
+                rectf(kx, track.top + 3.0 * s, k, k),
+                k / 2.0,
+                if on { pal().on_accent } else { pal().text_primary },
+            );
+            self.hit(PanelHit::Radio(sel, !on), rectf(track.left - 6.0 * s, y, w + 12.0 * s, 24.0 * s), true);
+        }
+        self.y += 24.0 * s + 8.0 * s;
+    }
+    /// A plain message line.
+    fn note(&mut self, t: &str) {
+        let (l, r) = self.inner();
+        let s = self.s;
+        self.text(t, Font::Body, rectf(l, self.y, r - l, 28.0 * s), pal().text_secondary, Align::Leading);
+        self.y += 28.0 * s;
+    }
     fn divider(&mut self) {
         let (l, r) = self.inner();
         self.y += 6.0 * self.s;
@@ -203,6 +241,17 @@ impl App {
         {
             self.devices = a.render_devices();
         }
+        if kind == PanelKind::Wifi {
+            self.network.set_scan_wanted(true);
+            self.network.scan();
+            self.wifi_networks = self.network.available_networks();
+        } else if self.panel_is(PanelKind::Wifi) {
+            self.network.set_scan_wanted(false);
+        }
+        if kind == PanelKind::Bluetooth {
+            self.sysmon.refresh_bt_devices();
+        }
+        log!("flyout: open {kind:?}");
         let (y, m, _) = clock::today();
         let was_open = self.panel.is_some();
         self.panel = Some(PanelState {
@@ -219,14 +268,17 @@ impl App {
     }
 
     pub fn close_panel(&mut self) {
-        if let Some(p) = self.panel.take()
-            && p.drag.is_some()
-        {
+        let Some(p) = self.panel.take() else { return };
+        if p.drag.is_some() {
             unsafe {
                 let _ = ReleaseCapture();
             }
         }
+        if p.kind == PanelKind::Wifi {
+            self.network.set_scan_wanted(false);
+        }
         self.flyout.hide();
+        self.update_visibility();
     }
 
     /// Rebuild an open panel after its data changed (no animation).
@@ -247,6 +299,8 @@ impl App {
             PanelKind::Sound => self.build_sound(&mut b),
             PanelKind::Battery => self.build_battery(&mut b),
             PanelKind::Calendar => self.build_calendar(&mut b, p.cal),
+            PanelKind::Wifi => self.build_wifi(&mut b),
+            PanelKind::Bluetooth => self.build_bluetooth(&mut b),
             PanelKind::WindowList(id) => self.build_window_list(&mut b, id),
         }
         b.y += FLYOUT_PAD * s;
@@ -482,6 +536,115 @@ impl App {
         b.y += 6.0 * cell_h;
         b.divider();
         b.link("Date & time settings", "ms-settings:dateandtime");
+    }
+
+    fn build_wifi(&self, b: &mut Builder) {
+        use winshell::network::NetState;
+        let s = b.s;
+        b.header_toggle("Wi-Fi", self.wifi_radio, RadioSel::Wifi);
+        if self.net_state == NetState::Ethernet {
+            let (l, r) = b.inner();
+            b.glyph(glyph::ETHERNET, rectf(l, b.y, 28.0 * s, 32.0 * s), pal().text_primary);
+            b.text(
+                "Ethernet connected",
+                Font::Body,
+                rectf(l + 36.0 * s, b.y, r - l - 36.0 * s, 32.0 * s),
+                pal().text_primary,
+                Align::Leading,
+            );
+            b.y += 32.0 * s;
+        }
+        if self.wifi_radio == Some(false) {
+            b.note("Wi-Fi is turned off");
+        } else if self.wifi_networks.is_empty() {
+            b.note("Looking for networks…");
+        } else {
+            for n in &self.wifi_networks {
+                let (l, r) = b.inner();
+                let row_h = 44.0 * s;
+                let row = rectf(l, b.y, r - l, row_h);
+                let g = match n.quality {
+                    0..=32 => glyph::WIFI_1,
+                    33..=65 => glyph::WIFI_2,
+                    66..=89 => glyph::WIFI_3,
+                    _ => glyph::WIFI,
+                };
+                b.glyph(g, rectf(l, b.y, 28.0 * s, row_h), if n.connected { pal().accent } else { pal().text_primary });
+                let tx = l + 36.0 * s;
+                let action_w = if n.connected { 84.0 * s } else { 0.0 };
+                let tw = r - tx - action_w - 6.0 * s;
+                b.text(&n.ssid, Font::Body, rectf(tx, b.y + 4.0 * s, tw, 20.0 * s), pal().text_primary, Align::Leading);
+                let status = match (n.connected, n.secured) {
+                    (true, true) => "Connected, secured",
+                    (true, false) => "Connected, open",
+                    (false, true) => "Secured",
+                    (false, false) => "Open",
+                };
+                b.text(
+                    status,
+                    Font::Sub,
+                    rectf(tx, b.y + 23.0 * s, tw, 18.0 * s),
+                    pal().text_secondary,
+                    Align::Leading,
+                );
+                if n.connected {
+                    let btn = rectf(r - action_w, b.y + 8.0 * s, action_w, 28.0 * s);
+                    b.text("Disconnect", Font::Pill, btn, pal().accent, Align::Center);
+                    b.hit(PanelHit::WifiDisconnect, btn, true);
+                } else {
+                    let hit = match &n.profile {
+                        Some(p) => PanelHit::WifiConnect(p.clone()),
+                        None => PanelHit::WifiPicker,
+                    };
+                    b.hit(hit, row, true);
+                }
+                b.y += row_h;
+            }
+        }
+        b.divider();
+        b.link("Other networks", "ms-availablenetworks:");
+        b.link("More Wi-Fi settings", "ms-settings:network-wifi");
+    }
+
+    fn build_bluetooth(&self, b: &mut Builder) {
+        let s = b.s;
+        b.header_toggle("Bluetooth", self.bluetooth, RadioSel::Bluetooth);
+        match self.bluetooth {
+            None => b.note("No Bluetooth adapter"),
+            Some(false) => b.note("Bluetooth is turned off"),
+            Some(true) if self.bt_devices.is_empty() => b.note("No paired devices"),
+            Some(true) => {
+                for d in &self.bt_devices {
+                    let (l, r) = b.inner();
+                    let row_h = 44.0 * s;
+                    b.glyph(
+                        glyph::BLUETOOTH,
+                        rectf(l, b.y, 28.0 * s, row_h),
+                        if d.connected { pal().accent } else { pal().text_primary },
+                    );
+                    let tx = l + 36.0 * s;
+                    b.text(
+                        &d.name,
+                        Font::Body,
+                        rectf(tx, b.y + 4.0 * s, r - tx, 20.0 * s),
+                        pal().text_primary,
+                        Align::Leading,
+                    );
+                    let status = if d.connected { "Connected" } else { "Paired" };
+                    b.text(
+                        status,
+                        Font::Sub,
+                        rectf(tx, b.y + 23.0 * s, r - tx, 18.0 * s),
+                        pal().text_secondary,
+                        Align::Leading,
+                    );
+                    b.y += row_h;
+                }
+            }
+        }
+        b.divider();
+        b.link("Add a device", "ms-settings:connecteddevices");
+        b.link("More Bluetooth settings", "ms-settings:bluetooth");
     }
 
     fn build_window_list(&self, b: &mut Builder, group_id: &str) {
@@ -739,6 +902,20 @@ impl App {
             PanelHit::Link(uri) => {
                 self.close_panel();
                 actions::shell_open(uri, None);
+            }
+            PanelHit::Radio(sel, on) => self.sysmon.set_radio(sel, on),
+            PanelHit::WifiConnect(profile) => {
+                if !self.network.connect(&profile) {
+                    self.close_panel();
+                    actions::shell_open("ms-availablenetworks:", None);
+                }
+            }
+            PanelHit::WifiDisconnect => {
+                self.network.disconnect();
+            }
+            PanelHit::WifiPicker => {
+                self.close_panel();
+                actions::shell_open("ms-availablenetworks:", None);
             }
             PanelHit::CalPrev | PanelHit::CalNext | PanelHit::CalToday => {
                 if let Some(p) = self.panel.as_mut() {
