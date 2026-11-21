@@ -19,16 +19,20 @@ name = "spike"
 path = "src/bin/spike.rs"
 
 [target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
 windows-numerics = "0.3"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Control",
+    "Storage_Streams",
+    "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",
     "Win32_Globalization",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_Storage_Packaging_Appx",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_Direct3D",
@@ -39,13 +43,25 @@ features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
+    "Win32_System_Power",
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Variant",
+    "Win32_System_WinRT",
     "Win32_UI_Accessibility",
     "Win32_UI_Controls",
     "Win32_UI_HiDpi",
@@ -63,3 +79,8 @@ panic = "abort"
 strip = true
 incremental = false
 overflow-checks = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+toml = { version = "1.2.2", default-features = false, features = ["parse", "serde"] }
+toml_edit = "0.25.20"

@@ -1,9 +1,9 @@
-//! Running-app model behind the dock (PLAN.md section 6, `DockAppGroup`).
+//! Dock model (PLAN.md section 6, `DockAppGroup`).
 //!
-//! Pure data: windows are grouped by app id (AUMID, or lowercased exe path).
-//! Group order is stable: existing groups keep their slot, new apps append at
-//! the end, and a group disappears when its last window goes (pinning arrives
-//! in M4).
+//! Pure data. Windows are grouped by app id (AUMID, or lowercased exe path).
+//! Order: pinned apps first, in pin order (they stay even with no windows),
+//! then running unpinned apps in the order they appeared. A running group
+//! keeps its slot; an unpinned group disappears with its last window.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowEntry {
@@ -17,6 +17,16 @@ pub struct WindowEntry {
     pub is_elevated: bool,
 }
 
+/// A pinned app as resolved from `config.toml`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinSpec {
+    pub app_id: String,
+    pub exe_path: String,
+    pub aumid: Option<String>,
+    /// The exact string in `config.toml` (used to unpin).
+    pub entry: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppGroup {
     pub id: String,
@@ -24,28 +34,52 @@ pub struct AppGroup {
     pub display_name: String,
     pub exe_path: String,
     pub aumid: Option<String>,
+    pub is_pinned: bool,
     pub windows: Vec<WindowEntry>,
     /// Index into `windows` of the most recently focused window.
     pub active_window_idx: usize,
 }
 
 impl AppGroup {
-    fn new(w: &WindowEntry) -> Self {
+    fn from_window(w: &WindowEntry) -> Self {
         Self {
             id: w.app_id.clone(),
             display_name: String::new(),
             exe_path: w.exe_path.clone(),
             aumid: w.aumid.clone(),
+            is_pinned: false,
             windows: Vec::new(),
             active_window_idx: 0,
         }
+    }
+
+    fn from_pin(p: &PinSpec) -> Self {
+        Self {
+            id: p.app_id.clone(),
+            display_name: String::new(),
+            exe_path: p.exe_path.clone(),
+            aumid: p.aumid.clone(),
+            is_pinned: true,
+            windows: Vec::new(),
+            active_window_idx: 0,
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.windows.is_empty()
+    }
+
+    /// The window to act on for a click: the most recently focused one.
+    pub fn active_window(&self) -> Option<&WindowEntry> {
+        self.windows.get(self.active_window_idx).or_else(|| self.windows.first())
     }
 }
 
 #[derive(Default, Debug)]
 pub struct DockModel {
     groups: Vec<AppGroup>,
-    focused: Option<usize>,
+    pins: Vec<PinSpec>,
+    focused_hwnd: isize,
 }
 
 impl DockModel {
@@ -53,13 +87,26 @@ impl DockModel {
         &self.groups
     }
 
+    pub fn pins(&self) -> &[PinSpec] {
+        &self.pins
+    }
+
     pub fn group_mut(&mut self, id: &str) -> Option<&mut AppGroup> {
         self.groups.iter_mut().find(|g| g.id == id)
     }
 
+    /// Number of leading pinned groups (for the separator after them).
+    pub fn pinned_count(&self) -> usize {
+        self.groups.iter().take_while(|g| g.is_pinned).count()
+    }
+
+    pub fn pin_for(&self, id: &str) -> Option<&PinSpec> {
+        self.pins.iter().find(|p| p.app_id == id)
+    }
+
     /// Index of the group that owns the focused window, if it is in the dock.
     pub fn focused(&self) -> Option<usize> {
-        self.focused
+        self.locate(self.focused_hwnd).map(|(gi, _)| gi)
     }
 
     pub fn contains(&self, hwnd: isize) -> bool {
@@ -67,10 +114,38 @@ impl DockModel {
     }
 
     fn locate(&self, hwnd: isize) -> Option<(usize, usize)> {
+        if hwnd == 0 {
+            return None;
+        }
         self.groups
             .iter()
             .enumerate()
             .find_map(|(gi, g)| g.windows.iter().position(|w| w.hwnd == hwnd).map(|wi| (gi, wi)))
+    }
+
+    /// Pinned groups first in pin order, then the rest in their current order;
+    /// every pin has a group; unpinned groups without windows are dropped.
+    fn normalize(&mut self) {
+        for g in &mut self.groups {
+            g.is_pinned = self.pins.iter().any(|p| p.app_id == g.id);
+        }
+        for p in &self.pins {
+            if !self.groups.iter().any(|g| g.id == p.app_id) {
+                self.groups.push(AppGroup::from_pin(p));
+            }
+        }
+        self.groups.retain(|g| g.is_pinned || !g.windows.is_empty());
+        let pins = &self.pins;
+        let rank = |g: &AppGroup| pins.iter().position(|p| p.app_id == g.id).unwrap_or(usize::MAX);
+        self.groups.sort_by_key(rank); // stable: running apps keep their relative order
+    }
+
+    /// Replace the pin list (config load or pin/unpin). Returns true if the dock changed.
+    pub fn set_pins(&mut self, pins: Vec<PinSpec>) -> bool {
+        let before = self.groups.clone();
+        self.pins = pins;
+        self.normalize();
+        self.groups != before
     }
 
     /// Insert or update a window. Returns true if anything visible changed.
@@ -87,11 +162,12 @@ impl DockModel {
         match self.groups.iter().position(|g| g.id == w.app_id) {
             Some(gi) => self.groups[gi].windows.push(w),
             None => {
-                let mut g = AppGroup::new(&w);
+                let mut g = AppGroup::from_window(&w);
                 g.windows.push(w);
                 self.groups.push(g);
             }
         }
+        self.normalize();
         true
     }
 
@@ -103,14 +179,7 @@ impl DockModel {
         if g.active_window_idx >= g.windows.len() {
             g.active_window_idx = g.windows.len().saturating_sub(1);
         }
-        if g.windows.is_empty() {
-            self.groups.remove(gi);
-            self.focused = match self.focused {
-                Some(f) if f == gi => None,
-                Some(f) if f > gi => Some(f - 1),
-                f => f,
-            };
-        }
+        self.normalize();
         true
     }
 
@@ -118,39 +187,32 @@ impl DockModel {
     /// appends new ones, drops vanished ones. Returns true if anything changed.
     pub fn replace_all(&mut self, windows: Vec<WindowEntry>) -> bool {
         let before = self.groups.clone();
-        let names: Vec<(String, String)> = self.groups.iter().map(|g| (g.id.clone(), g.display_name.clone())).collect();
-        let mut fresh = DockModel::default();
-        // Seed existing group order first so slots do not jump around.
-        for (id, _) in &names {
-            for w in windows.iter().filter(|w| &w.app_id == id) {
-                fresh.upsert(w.clone());
-            }
-        }
+        let mut fresh: Vec<AppGroup> =
+            self.groups.iter().map(|g| AppGroup { windows: Vec::new(), active_window_idx: 0, ..g.clone() }).collect();
         for w in windows {
-            if !fresh.contains(w.hwnd) {
-                fresh.upsert(w);
+            match fresh.iter().position(|g| g.id == w.app_id) {
+                Some(gi) => fresh[gi].windows.push(w),
+                None => {
+                    let mut g = AppGroup::from_window(&w);
+                    g.windows.push(w);
+                    fresh.push(g);
+                }
             }
         }
-        for g in &mut fresh.groups {
-            if let Some((_, n)) = names.iter().find(|(id, _)| id == &g.id) {
-                g.display_name = n.clone();
-            }
-        }
-        self.groups = fresh.groups;
-        self.focused = None;
+        self.groups = fresh;
+        self.normalize();
         self.groups != before
     }
 
     /// Record the focused top-level window (root owner of the foreground).
     /// Returns true if the focused group changed.
     pub fn set_focused(&mut self, hwnd: isize) -> bool {
-        let new = self.locate(hwnd).map(|(gi, wi)| {
+        let before = self.focused();
+        if let Some((gi, wi)) = self.locate(hwnd) {
             self.groups[gi].active_window_idx = wi;
-            gi
-        });
-        let changed = new != self.focused;
-        self.focused = new;
-        changed
+        }
+        self.focused_hwnd = hwnd;
+        self.focused() != before
     }
 }
 
@@ -168,6 +230,10 @@ mod tests {
             process_id: 1,
             is_elevated: false,
         }
+    }
+
+    fn pin(app: &str) -> PinSpec {
+        PinSpec { app_id: app.into(), exe_path: format!("c:\\{app}.exe"), aumid: None, entry: app.into() }
     }
 
     fn ids(m: &DockModel) -> Vec<&str> {
@@ -195,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_last_window_drops_group() {
+    fn removing_last_window_drops_unpinned_group() {
         let mut m = DockModel::default();
         m.upsert(win(1, "a"));
         m.upsert(win(2, "b"));
@@ -221,13 +287,14 @@ mod tests {
         assert!(m.set_focused(3));
         assert_eq!(m.focused(), Some(1));
         assert_eq!(m.groups()[1].active_window_idx, 1);
+        assert_eq!(m.groups()[1].active_window().unwrap().hwnd, 3);
         assert!(!m.set_focused(2)); // same group
         assert!(m.set_focused(99)); // not in dock
         assert_eq!(m.focused(), None);
     }
 
     #[test]
-    fn focus_index_shifts_when_earlier_group_removed() {
+    fn focus_follows_window_when_slots_shift() {
         let mut m = DockModel::default();
         m.upsert(win(1, "a"));
         m.upsert(win(2, "b"));
@@ -243,8 +310,7 @@ mod tests {
         m.upsert(win(1, "a"));
         m.upsert(win(2, "b"));
         m.group_mut("b").unwrap().display_name = "Bee".into();
-        let changed = m.replace_all(vec![win(5, "c"), win(2, "b"), win(4, "b")]);
-        assert!(changed);
+        assert!(m.replace_all(vec![win(5, "c"), win(2, "b"), win(4, "b")]));
         assert_eq!(ids(&m), ["b", "c"]);
         assert_eq!(m.groups()[0].display_name, "Bee");
         assert_eq!(m.groups()[0].windows.len(), 2);
@@ -255,5 +321,47 @@ mod tests {
         let mut m = DockModel::default();
         m.upsert(win(1, "a"));
         assert!(!m.replace_all(vec![win(1, "a")]));
+    }
+
+    #[test]
+    fn pins_come_first_in_pin_order_and_persist_without_windows() {
+        let mut m = DockModel::default();
+        m.upsert(win(1, "running"));
+        m.upsert(win(2, "b"));
+        m.set_pins(vec![pin("b"), pin("a")]);
+        assert_eq!(ids(&m), ["b", "a", "running"]);
+        assert_eq!(m.pinned_count(), 2);
+        assert!(m.groups()[0].is_running() && !m.groups()[1].is_running());
+        m.remove(2);
+        assert_eq!(ids(&m), ["b", "a", "running"]);
+        assert!(!m.groups()[0].is_running());
+    }
+
+    #[test]
+    fn unpinning_an_idle_app_removes_it_but_keeps_running_ones() {
+        let mut m = DockModel::default();
+        m.upsert(win(1, "a"));
+        m.set_pins(vec![pin("a"), pin("idle")]);
+        assert!(m.set_pins(vec![]));
+        assert_eq!(ids(&m), ["a"]);
+        assert!(!m.groups()[0].is_pinned);
+    }
+
+    #[test]
+    fn new_window_of_pinned_app_joins_pinned_slot() {
+        let mut m = DockModel::default();
+        m.set_pins(vec![pin("a")]);
+        m.upsert(win(1, "z"));
+        m.upsert(win(2, "a"));
+        assert_eq!(ids(&m), ["a", "z"]);
+        assert_eq!(m.groups()[0].windows.len(), 1);
+    }
+
+    #[test]
+    fn replace_all_keeps_pins() {
+        let mut m = DockModel::default();
+        m.set_pins(vec![pin("a")]);
+        m.replace_all(vec![win(1, "b")]);
+        assert_eq!(ids(&m), ["a", "b"]);
     }
 }

@@ -87,3 +87,31 @@ fn format_with(f: impl Fn(Option<&mut [u16]>) -> i32) -> String {
     }
     String::from_utf16_lossy(&buf[..(n as usize - 1)])
 }
+
+/// Format a date with a GetDateFormatEx picture ("dddd, d MMMM", "MMMM yyyy", "ddd").
+pub fn format_date(year: i32, month: u32, day: u32, picture: &str) -> String {
+    let t = SYSTEMTIME { wYear: year as u16, wMonth: month as u16, wDay: day as u16, ..Default::default() };
+    let pic = windows::core::HSTRING::from(picture);
+    format_with(|buf| unsafe {
+        GetDateFormatEx(PCWSTR::null(), ENUM_DATE_FORMATS_FLAGS(0), Some(&t), &pic, buf, PCWSTR::null())
+    })
+}
+
+/// Today's (year, month, day) in local time.
+pub fn today() -> (i32, u32, u32) {
+    let t = unsafe { GetLocalTime() };
+    (t.wYear as i32, t.wMonth as u32, t.wDay as u32)
+}
+
+/// First day of the week for the user's locale: 0 = Sunday .. 6 = Saturday.
+pub fn first_weekday() -> u32 {
+    use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_IFIRSTDAYOFWEEK};
+    let mut buf = [0u16; 4];
+    let n = unsafe { GetLocaleInfoEx(PCWSTR::null(), LOCALE_IFIRSTDAYOFWEEK, Some(&mut buf)) };
+    if n < 2 {
+        return 1;
+    }
+    // LOCALE_IFIRSTDAYOFWEEK: 0 = Monday .. 6 = Sunday.
+    let v = (buf[0] as u32).saturating_sub('0' as u32).min(6);
+    (v + 1) % 7
+}

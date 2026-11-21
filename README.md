@@ -5,7 +5,7 @@ a floating dock and flyout panels, drawn with Direct2D + DirectComposition over
 the DWM backdrop. `explorer.exe` keeps running; nothing needs admin rights.
 See [PLAN.md](PLAN.md) for the full design.
 
-**Status: Milestone 3** (dock shows running apps), on top of M2 (active window, clock) and M1 (spike, scaffolding, recovery hotkey).
+**Status: Milestones 1–7 built** (M8 themes / live reload and M9 packaging remain). Nothing has been run on Windows yet; see the checks under each milestone.
 
 ## Requirements
 
@@ -86,6 +86,9 @@ at the bottom (maximised windows stop at both), lays out around the native
 taskbar edge, hides on fullscreen apps and re-registers after an Explorer
 restart. Exit with the emergency hotkey.
 
+Options: `--reserve layered|hidden|plan`, `--backdrop acrylic|mica|tabbed|none`,
+`--corners round|small|none`, `--no-taskbar` (leave the native taskbar alone this run).
+
 ## M2: active window and clock
 
 The top bar's left zone shows your user handle and the active window's icon
@@ -140,6 +143,89 @@ Things to check:
 4. Move a window to another virtual desktop: its icon leaves the dock.
 5. Memory gate: idle Private Working Set ≤ 32 MB with your usual apps open.
 
+## Configuration
+
+`%APPDATA%\WinShellTheme\config.toml` is created on first run (schema from
+PLAN.md section 11). Changes apply on restart until M8 adds live reload.
+
+```toml
+[general]
+user_handle = ""                 # empty = "@" + your Windows user name
+
+[top_bar]
+enabled_pills = ["bluetooth", "wifi", "volume", "battery", "clock", "notifications", "quick_settings"]
+
+[dock]
+magnification = false            # draw the hovered icon at 1.15x
+pinned_apps = ["explorer.exe"]   # exe paths, bare names on PATH, or AUMIDs
+
+[taskbar]
+autohide_native = true
+```
+
+## M4: pinning, launching, switching
+
+* **Start** taps the Windows key (native Start menu).
+* **Click an icon:** not running → launch; one window → bring it forward, or
+  minimise it if it is already in front; several windows → a window list
+  above the icon (plus "New window").
+* **Middle-click:** always a new instance.
+* **Right-click:** New window / Open, Pin to Dock / Unpin from Dock, Close
+  window(s), Quit app (closes every window of the app politely; never kills).
+* **Pinned apps** sit before the running ones, separated by a divider, and stay
+  when closed. Pinning edits `config.toml` with `toml_edit`, so your comments
+  and layout survive.
+* **Hover:** highlight plus a capsule tooltip with the app's name. With
+  `magnification = true` the hovered icon is drawn at 1.15x.
+* **Administrator windows** get a shield badge; if Windows refuses to switch
+  to one, a short message appears above the dock instead of failing silently.
+* **Active window pill (top bar):** click to minimise / restore, right-click for
+  Minimize, Maximize, Snap left, Snap right, Close.
+
+## M5: native taskbar autohide
+
+With `autohide_native = true` (default), once the bar and dock are up the
+native taskbar is switched to autohide, the normal user setting. Its original
+state is written to `taskbar_state.toml` **before** the change and restored
+exactly on clean exit, on a crash (panic hook), via the emergency hotkey, and
+on the next launch after a kill (a leftover state file means the last run did
+not exit cleanly). The taskbar window itself is never hidden or modified.
+
+Check with autohide **off** and **on** before launch: after exit (and after
+killing `winshell.exe` in Task Manager and starting it again), the setting in
+Settings → Personalization → Taskbar must be back to what it was.
+
+## M6: status pills
+
+Left to right: Bluetooth, Wi-Fi, volume, battery, clock, notifications, quick
+settings. All callback-driven: Core Audio volume/device callbacks, WLAN and IP
+interface notifications, power-setting notifications, and the WinRT Bluetooth
+radio on the system monitor thread. Bluetooth hides without a radio, battery
+hides without a battery; Ethernet shows its own glyph.
+
+* Volume → Sound flyout (right-click toggles mute). Battery → Battery flyout.
+  Clock → Calendar flyout.
+* Wi-Fi / Bluetooth → their Settings pages (in-flyout lists are v2).
+* Bell / gear → Win+N / Win+A (v1 stopgap: the native flyouts open at the
+  native taskbar's edge).
+
+## M7: flyouts and media
+
+One 340 px flyout under the top bar, sliding in 8 px and fading over 140 ms
+with DirectComposition animations (no CPU frame loop). It closes when you
+click elsewhere or press Esc.
+
+* **Sound:** volume and microphone sliders (drag), mute toggles, Volume mixer
+  link, output device list (switches the default device via the undocumented
+  `IPolicyConfig`; any failure opens Sound settings instead), and up to three
+  media session cards with album art, a tint taken from the art, and
+  previous / play-pause / next.
+* **Battery:** percentage, charging / time left, energy saver, settings link.
+* **Calendar:** today's date, month grid in your locale's week order, month
+  navigation (click the month title to jump back to today).
+* **Dock mini player:** album art, title, artist and play/pause for the
+  current media session; click it for the Sound flyout.
+
 ## Files
 
 | Path | Contents |
@@ -147,6 +233,8 @@ Things to check:
 | `%APPDATA%\WinShellTheme\winshell.log` | app log (layout, AppBar events, memory) |
 | `%APPDATA%\WinShellTheme\spike.log` | spike log |
 | `%APPDATA%\WinShellTheme\crash.log` | panic log |
+| `%APPDATA%\WinShellTheme\config.toml` | settings and pinned apps |
+| `%APPDATA%\WinShellTheme\taskbar_state.toml` | original taskbar state (only while running or after a crash) |
 
 ## Source layout
 
@@ -166,5 +254,13 @@ Things to check:
 | `src/dock_model.rs` | running-app grouping (unit-tested) |
 | `src/lru.rs` | byte-budgeted icon cache (unit-tested) |
 | `src/util.rs` | pure helpers with unit tests |
-| `src/main.rs` | the shell app |
+| `src/config.rs` | config.toml schema and comment-preserving pin edits (unit-tested) |
+| `src/taskbar.rs`, `src/taskbar_state.rs` | taskbar autohide and exact restore |
+| `src/actions.rs` | launch, activate, minimise, snap, close, send keys |
+| `src/audio.rs` | Core Audio volume, devices, default-device switching |
+| `src/network.rs` | Wi-Fi / Ethernet status |
+| `src/power.rs` | battery status and notifications |
+| `src/sysmon.rs` | system monitor thread: Bluetooth radio, media sessions, album art |
+| `src/calendar.rs` | month grid maths (unit-tested) |
+| `src/main.rs`, `src/shell/` | the shell app: bar, dock, flyout panels, tooltip |
 | `src/bin/spike.rs` | M1 spike |

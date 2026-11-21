@@ -11,6 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::util::{all_alpha_zero, premultiply_bgra};
 
+#[derive(Debug)]
 pub struct Bgra {
     pub width: u32,
     pub height: u32,

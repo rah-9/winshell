@@ -215,3 +215,21 @@ pub fn describe_notification(wparam: usize, lparam: LPARAM) -> String {
         other => format!("ABN_{other}"),
     }
 }
+
+/// Raw `ABM_GETSTATE` value of the native taskbar (`ABS_AUTOHIDE` | `ABS_ALWAYSONTOP`).
+pub fn taskbar_state() -> u32 {
+    let mut abd = data(HWND::default());
+    unsafe { SHAppBarMessage(ABM_GETSTATE, &mut abd) as u32 }
+}
+
+/// `ABM_SETSTATE` on the native taskbar. This is the ordinary user setting
+/// (Settings > Personalization > Taskbar > Automatically hide); the taskbar
+/// window itself is never hidden or restyled.
+pub fn set_taskbar_state(state: u32) {
+    let tray = unsafe { FindWindowW(windows::core::w!("Shell_TrayWnd"), None) }.unwrap_or_default();
+    let mut abd = data(tray);
+    abd.lParam = LPARAM(state as isize);
+    unsafe {
+        SHAppBarMessage(ABM_SETSTATE, &mut abd);
+    }
+}

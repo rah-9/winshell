@@ -108,6 +108,20 @@ impl Gfx {
         Ok(f)
     }
 
+    /// True if `family` is installed (e.g. Segoe Fluent Icons vs. MDL2 Assets).
+    pub fn font_exists(&self, family: &str) -> bool {
+        unsafe {
+            let mut coll = None;
+            if self.dwrite.GetSystemFontCollection(&mut coll, false).is_err() {
+                return false;
+            }
+            let Some(coll) = coll else { return false };
+            let (mut index, mut exists) = (0u32, windows::core::BOOL(0));
+            coll.FindFamilyName(&windows::core::HSTRING::from(family), &mut index, &mut exists).is_ok()
+                && exists.as_bool()
+        }
+    }
+
     pub fn text_format(&self, family: PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
         unsafe {
             let f = self.dwrite.CreateTextFormat(
@@ -177,6 +191,33 @@ impl WindowSurface {
         }
         self.width = w;
         self.height = h;
+        Ok(())
+    }
+
+    /// Compositor-driven open animation (PLAN.md section 2): content slides
+    /// `from_y` px to 0 and fades 0 -> 1 over `ms` with a cubic ease-out. No
+    /// CPU frames: DirectComposition evaluates the curves itself.
+    pub fn animate_open(&self, gfx: &Gfx, from_y: f32, ms: f32) -> Result<()> {
+        let d = (ms / 1000.0) as f64;
+        // value(t) = a + delta * (3u - 3u^2 + u^3), u = t / d  (1 - (1 - u)^3)
+        let curve = |from: f32, to: f32| -> Result<IDCompositionAnimation> {
+            let delta = to - from;
+            let df = d as f32;
+            unsafe {
+                let a = gfx.dcomp.CreateAnimation()?;
+                a.AddCubic(0.0, from, 3.0 * delta / df, -3.0 * delta / (df * df), delta / (df * df * df))?;
+                a.End(d, to)?;
+                Ok(a)
+            }
+        };
+        unsafe {
+            let offset = curve(from_y, 0.0)?;
+            self.visual.SetOffsetY(&offset)?;
+            let fade = curve(0.0, 1.0)?;
+            let effect = gfx.dcomp.CreateEffectGroup()?;
+            effect.SetOpacity(&fade)?;
+            self.visual.SetEffect(&effect)?;
+        }
         Ok(())
     }
 
@@ -279,4 +320,29 @@ pub fn text(dc: &ID2D1DeviceContext, s: &str, fmt: &IDWriteTextFormat, r: D2D_RE
 pub fn draw_bitmap(dc: &ID2D1DeviceContext, bmp: &ID2D1Bitmap1, dest: D2D_RECT_F) -> Result<()> {
     unsafe { dc.DrawBitmap(bmp, Some(&dest), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None) };
     Ok(())
+}
+
+/// Draw `s` with the given horizontal alignment (the shared format is reset to leading).
+pub fn text_aligned(
+    dc: &ID2D1DeviceContext,
+    s: &str,
+    fmt: &IDWriteTextFormat,
+    r: D2D_RECT_F,
+    c: u32,
+    align: DWRITE_TEXT_ALIGNMENT,
+) -> Result<()> {
+    unsafe {
+        fmt.SetTextAlignment(align)?;
+    }
+    let res = text(dc, s, fmt, r, c);
+    unsafe {
+        fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+    }
+    res
+}
+
+/// A single icon-font glyph centred in `r`.
+pub fn glyph(dc: &ID2D1DeviceContext, g: char, fmt: &IDWriteTextFormat, r: D2D_RECT_F, c: u32) -> Result<()> {
+    let mut buf = [0u8; 4];
+    text_aligned(dc, g.encode_utf8(&mut buf), fmt, r, c, DWRITE_TEXT_ALIGNMENT_CENTER)
 }

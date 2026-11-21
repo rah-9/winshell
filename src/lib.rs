@@ -1,19 +1,26 @@
 //! WinShellTheme: a user-mode Windows 11 shell overlay (top bar + dock).
 //!
 //! Shared building blocks for the `winshell` binary and the throwaway `spike`
-//! binary. `dock_model`, `lru` and `util` hold pure logic so they can be
+//! binary. `calendar`, `config`, `dock_model`, `lru`, `taskbar_state` and `util` hold pure logic so they can be
 //! unit-tested on any host; everything else is Windows-only.
 
+pub mod calendar;
+pub mod config;
 pub mod dock_model;
 pub mod lru;
+pub mod taskbar_state;
 pub mod util;
 
+#[cfg(windows)]
+pub mod actions;
 #[cfg(windows)]
 pub mod appbar;
 #[cfg(windows)]
 pub mod apps;
 #[cfg(windows)]
 pub mod assets;
+#[cfg(windows)]
+pub mod audio;
 #[cfg(windows)]
 pub mod clock;
 #[cfg(windows)]
@@ -31,7 +38,15 @@ pub mod log;
 #[cfg(windows)]
 pub mod mem;
 #[cfg(windows)]
+pub mod network;
+#[cfg(windows)]
+pub mod power;
+#[cfg(windows)]
 pub mod render;
+#[cfg(windows)]
+pub mod sysmon;
+#[cfg(windows)]
+pub mod taskbar;
 #[cfg(windows)]
 pub mod win;
 #[cfg(windows)]

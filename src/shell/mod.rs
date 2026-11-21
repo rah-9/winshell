@@ -1,0 +1,1037 @@
+//! The shell app (PLAN.md section 13).
+//!
+//! * M1: invisible click-through AppBars, blurred top bar and dock, emergency hotkey.
+//! * M2: live active window icon + title, minute-boundary clock.
+//! * M3: running apps in the dock (WinEvent hooks, shell icons, LRU cache).
+//! * M4: pinning (config.toml via toml_edit), launch / activate / minimise,
+//!   middle-click new instance, right-click menu, multi-window list, hover + tooltip.
+//! * M5: native taskbar autohide with exact restore (state file first).
+//! * M6: Bluetooth, Wi-Fi, volume and battery pills, all callback-driven.
+//! * M7: sound / battery / calendar flyouts with media session cards, and the
+//!   dock's mini media player.
+//!
+//! Threads: this UI thread (STA), the shell asset loader (STA) and the system
+//! monitor (MTA, WinRT). Workers report through channels + PostMessageW.
+
+mod bar;
+mod dock;
+mod panel;
+mod popup;
+mod theme;
+
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicIsize, Ordering};
+
+use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
+use windows::Win32::Graphics::DirectWrite::*;
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE};
+use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{HSTRING, PCWSTR, Result, w};
+
+use winshell::appbar::{self, AppBar, Edge, ReserveMode, WM_APPBAR_CALLBACK};
+use winshell::assets::{AssetLoader, WM_SHELL_ASSET};
+use winshell::audio::{AUDIO_DEVICES_CHANGED, Audio, AudioDevice, AudioState, WM_SHELL_AUDIO};
+use winshell::clock::{self, Clock};
+use winshell::config::{self, Config};
+use winshell::dock_model::DockModel;
+use winshell::dwm::{Backdrop, Corners, DwmStyle};
+use winshell::foreground::{ForegroundTracker, WM_SHELL_FOREGROUND, WM_SHELL_TITLE};
+use winshell::instance::SingleInstance;
+use winshell::lru::Lru;
+use winshell::mem::MemSnapshot;
+use winshell::network::{NetState, Network, WM_SHELL_NETWORK};
+use winshell::power::{self, BatteryState, PowerNotifications};
+use winshell::render::Gfx;
+use winshell::sysmon::{MediaSession, SystemMonitor, WM_SHELL_MONITOR};
+use winshell::taskbar::{self, TaskbarGuard};
+use winshell::win::{self, MonitorGeometry, px};
+use winshell::winevents::{WM_SHELL_WINDOWS, WindowEventHooks};
+use winshell::{hotkey, log};
+
+use bar::{Active, BarHit, BarLayout};
+use dock::{DockHit, DockLayout};
+use panel::PanelState;
+use popup::Popup;
+use theme::*;
+
+const TOPBAR_CLASS: PCWSTR = w!("WinShellTheme_TopBarClass");
+const WINDOW_CLASS: PCWSTR = w!("WinShellTheme_Window");
+const FLYOUT_CLASS: PCWSTR = w!("WinShellTheme_FlyoutClass");
+
+const TIMER_CLOCK: usize = 1;
+const TIMER_TOOLTIP_HIDE: usize = 2;
+
+const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const PBT_APMPOWERSTATUSCHANGE: u32 = 0x000A;
+
+/// Reservation HWNDs for the panic hook, which cannot borrow the app state.
+static TOP_RESERVE_HWND: AtomicIsize = AtomicIsize::new(0);
+static BOTTOM_RESERVE_HWND: AtomicIsize = AtomicIsize::new(0);
+
+thread_local! {
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    static PLAN_MODE: Cell<bool> = const { Cell::new(false) };
+    static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+}
+
+pub struct Options {
+    reserve: ReserveMode,
+    style: DwmStyle,
+    /// `--no-taskbar`: never touch the native taskbar this run.
+    keep_taskbar: bool,
+}
+
+impl Options {
+    fn from_args() -> std::result::Result<Self, String> {
+        let mut o = Options { reserve: ReserveMode::Layered, style: DwmStyle::default(), keep_taskbar: false };
+        let mut args = std::env::args().skip(1);
+        while let Some(a) = args.next() {
+            let mut val = |n: &str| args.next().ok_or(format!("{n} needs a value"));
+            match a.as_str() {
+                "--reserve" => o.reserve = ReserveMode::parse(&val("--reserve")?).ok_or("bad --reserve")?,
+                "--backdrop" => o.style.backdrop = Backdrop::parse(&val("--backdrop")?).ok_or("bad --backdrop")?,
+                "--corners" => o.style.corners = Corners::parse(&val("--corners")?).ok_or("bad --corners")?,
+                "--no-taskbar" => o.keep_taskbar = true,
+                "--autostart" => {}
+                other => return Err(format!("unknown argument {other}")),
+            }
+        }
+        Ok(o)
+    }
+}
+
+pub struct Fonts {
+    pub title: IDWriteTextFormat,
+    pub pill: IDWriteTextFormat,
+    pub icon: IDWriteTextFormat,
+    pub icon_small: IDWriteTextFormat,
+    pub header: IDWriteTextFormat,
+    pub body: IDWriteTextFormat,
+    pub body_bold: IDWriteTextFormat,
+    pub sub: IDWriteTextFormat,
+    pub big: IDWriteTextFormat,
+    pub scale: f32,
+}
+
+fn make_fonts(gfx: &Gfx, scale: f32) -> Result<Fonts> {
+    let ui = w!("Segoe UI Variable");
+    let icons = if gfx.font_exists("Segoe Fluent Icons") { w!("Segoe Fluent Icons") } else { w!("Segoe MDL2 Assets") };
+    Ok(Fonts {
+        title: gfx.text_format_ellipsis(ui, 13.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
+        pill: gfx.text_format(ui, 12.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
+        icon: gfx.text_format(icons, 16.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
+        icon_small: gfx.text_format(icons, 12.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
+        header: gfx.text_format_ellipsis(ui, 14.0 * scale, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+        body: gfx.text_format_ellipsis(ui, 13.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
+        body_bold: gfx.text_format_ellipsis(ui, 13.0 * scale, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+        sub: gfx.text_format_ellipsis(ui, 11.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
+        big: gfx.text_format(ui, 28.0 * scale, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+        scale,
+    })
+}
+
+/// A context menu to run once the app state is no longer borrowed
+/// (TrackPopupMenu runs a modal loop that re-enters the window procedure).
+pub struct MenuRequest {
+    owner: HWND,
+    x: i32,
+    y: i32,
+    above: bool,
+    /// (command id, label); id 0 = separator.
+    items: Vec<(u32, String)>,
+    context: MenuContext,
+}
+
+#[derive(Clone)]
+pub enum MenuContext {
+    Dock { group_id: String },
+    ActiveWindow { hwnd: isize },
+}
+
+pub struct App {
+    pub opts: Options,
+    pub config: Config,
+    pub config_path: PathBuf,
+    pub gfx: Gfx,
+    pub fonts: Fonts,
+    pub monitor: MonitorGeometry,
+    pub top_reserve: AppBar,
+    pub bottom_reserve: AppBar,
+    pub top_bar: Popup,
+    pub dock: Popup,
+    pub tooltip: Popup,
+    pub flyout: Popup,
+    pub user_handle: String,
+    pub fullscreen: bool,
+    // M2
+    pub clock: Clock,
+    pub clock_text: String,
+    pub tracker: ForegroundTracker,
+    pub active: Active,
+    pub bar: BarLayout,
+    pub bar_hover: Option<BarHit>,
+    pub first_tick_logged: bool,
+    // M3 / M4
+    pub dock_model: DockModel,
+    pub window_hooks: WindowEventHooks,
+    pub assets: AssetLoader,
+    pub icons: Lru<ID2D1Bitmap1>,
+    pub icon_requested: HashSet<String>,
+    pub app_names: HashMap<String, String>,
+    pub bottom_band: RECT,
+    pub span: (i32, i32),
+    pub dock_layout: DockLayout,
+    pub dock_hover: Option<DockHit>,
+    pub tooltip_text: String,
+    // M5
+    pub taskbar: TaskbarGuard,
+    // M6
+    pub audio: Option<Audio>,
+    pub audio_state: AudioState,
+    pub network: Network,
+    pub net_state: NetState,
+    pub battery: BatteryState,
+    pub power_notify: PowerNotifications,
+    pub sysmon: SystemMonitor,
+    pub bluetooth: Option<bool>,
+    // M7
+    pub media: Vec<MediaSession>,
+    pub media_bitmaps: HashMap<String, (usize, ID2D1Bitmap1)>,
+    pub devices: Vec<AudioDevice>,
+    pub panel: Option<PanelState>,
+}
+
+pub fn main() {
+    let dir = log::app_dir();
+    log::init(dir.join("winshell.log"), cfg!(debug_assertions));
+    install_panic_hook(dir.join("crash.log"));
+    win::enable_per_monitor_dpi();
+
+    let opts = match Options::from_args() {
+        Ok(o) => o,
+        Err(e) => {
+            log!("{e}");
+            std::process::exit(2);
+        }
+    };
+
+    let Some(_instance) = SingleInstance::acquire(w!("Local\\WinShellTheme.SingleInstance")) else {
+        log!("another instance is already running; exiting");
+        return;
+    };
+
+    // M5 step 1: repair the taskbar if the previous run died, before anything else.
+    let taskbar = TaskbarGuard::repair(dir.join("taskbar_state.toml"));
+
+    let config_path = dir.join("config.toml");
+    let (config, err) = config::load_or_create(&config_path);
+    if let Some(e) = err {
+        log!("config error, using defaults: {e}");
+    }
+
+    log!("winshell M7 starting (reserve={}, {:?})", opts.reserve.name(), opts.style);
+    if let Err(e) = run(opts, config, config_path, taskbar) {
+        log!("fatal: {e:?}");
+        cleanup_raw();
+        std::process::exit(1);
+    }
+}
+
+fn install_panic_hook(path: PathBuf) {
+    std::panic::set_hook(Box::new(move |info| {
+        cleanup_raw();
+        let line = format!("[{}] panic: {info}\n", log::timestamp());
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        log::write_line(&format!("panic: {info}"));
+    }));
+}
+
+/// Panic / fatal paths: restore the taskbar from its state file and remove the
+/// AppBars using only stored handles (the app state may be unreachable).
+fn cleanup_raw() {
+    taskbar::restore_from_file();
+    for slot in [&TOP_RESERVE_HWND, &BOTTOM_RESERVE_HWND] {
+        let h = slot.swap(0, Ordering::SeqCst);
+        if h != 0 {
+            appbar::remove_raw(HWND(h as _));
+        }
+    }
+}
+
+fn run(opts: Options, config: Config, config_path: PathBuf, taskbar: TaskbarGuard) -> Result<()> {
+    win::register_class(TOPBAR_CLASS, wndproc)?;
+    win::register_class(WINDOW_CLASS, wndproc)?;
+    win::register_class(FLYOUT_CLASS, wndproc)?;
+    PLAN_MODE.set(opts.reserve == ReserveMode::Plan);
+    TASKBAR_CREATED.set(unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) });
+
+    // UI thread is an STA (PLAN.md section 6); shell property stores and Core Audio need COM.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    }
+
+    let gfx = Gfx::new()?;
+    log!("graphics: shared devices created ({})", gfx.driver);
+
+    let bar_ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+    // The hotkey is registered on the first window, before anything can get stuck on screen.
+    let top_bar = Popup::create(&gfx, TOPBAR_CLASS, w!("WinShellTheme TopBar"), bar_ex, opts.style)?;
+    match hotkey::register_emergency(top_bar.hwnd) {
+        Some(c) => log!("emergency hotkey: {c}"),
+        None => log!("WARNING: emergency hotkey unavailable (Esc and F12 combinations both taken)"),
+    }
+    let dock = Popup::create(&gfx, WINDOW_CLASS, w!("WinShellTheme Dock"), bar_ex, opts.style)?;
+    let tooltip = Popup::create(&gfx, WINDOW_CLASS, w!("WinShellTheme Tooltip"), bar_ex, opts.style)?;
+    // The flyout takes focus so it can close when you click elsewhere (WA_INACTIVE) or press Esc.
+    let flyout_ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+    let flyout = Popup::create(&gfx, FLYOUT_CLASS, w!("WinShellTheme Flyout"), flyout_ex, opts.style)?;
+
+    let zero = win::rect(0, 0, 1, 1);
+    let top_res_hwnd = win::create_popup(WINDOW_CLASS, w!("WinShellTheme TopReserve"), opts.reserve.ex_style(), zero)?;
+    let bot_res_hwnd =
+        win::create_popup(WINDOW_CLASS, w!("WinShellTheme BottomReserve"), opts.reserve.ex_style(), zero)?;
+    TOP_RESERVE_HWND.store(top_res_hwnd.0 as isize, Ordering::SeqCst);
+    BOTTOM_RESERVE_HWND.store(bot_res_hwnd.0 as isize, Ordering::SeqCst);
+    let mut top_reserve = AppBar::new(top_res_hwnd, Edge::Top);
+    let mut bottom_reserve = AppBar::new(bot_res_hwnd, Edge::Bottom);
+    top_reserve.register();
+    bottom_reserve.register();
+
+    let monitor = MonitorGeometry::primary();
+    let fonts = make_fonts(&gfx, monitor.scale())?;
+    let user_handle = if config.general.user_handle.trim().is_empty() {
+        std::env::var("USERNAME").map(|u| format!("@{}", u.to_lowercase())).unwrap_or_else(|_| "@you".into())
+    } else {
+        config.general.user_handle.clone()
+    };
+    let top_hwnd = top_bar.hwnd;
+    let audio = Audio::new(top_hwnd);
+    if audio.is_none() {
+        log!("audio: Core Audio unavailable; volume pill hidden");
+    }
+
+    let mut app = App {
+        opts,
+        config,
+        config_path,
+        gfx,
+        fonts,
+        monitor,
+        top_reserve,
+        bottom_reserve,
+        top_bar,
+        dock,
+        tooltip,
+        flyout,
+        user_handle,
+        fullscreen: false,
+        clock: Clock::new(top_hwnd, TIMER_CLOCK),
+        clock_text: clock::now_text(),
+        tracker: ForegroundTracker::install(top_hwnd),
+        active: Active::desktop(),
+        bar: BarLayout::default(),
+        bar_hover: None,
+        first_tick_logged: false,
+        dock_model: DockModel::default(),
+        window_hooks: WindowEventHooks::install(top_hwnd),
+        assets: AssetLoader::start(top_hwnd),
+        icons: Lru::new(ICON_CACHE_BYTES),
+        icon_requested: HashSet::new(),
+        app_names: HashMap::new(),
+        bottom_band: zero,
+        span: (0, 1),
+        dock_layout: DockLayout::default(),
+        dock_hover: None,
+        tooltip_text: String::new(),
+        taskbar,
+        audio_state: audio.as_ref().map(|a| a.state()).unwrap_or_default(),
+        audio,
+        network: Network::start(top_hwnd),
+        net_state: NetState::Disconnected,
+        battery: power::battery(),
+        power_notify: PowerNotifications::register(top_hwnd),
+        sysmon: SystemMonitor::start(top_hwnd),
+        bluetooth: None,
+        media: Vec::new(),
+        media_bitmaps: HashMap::new(),
+        devices: Vec::new(),
+        panel: None,
+    };
+    app.net_state = app.network.state();
+    app.load_pins();
+    app.rescan("startup");
+    app.layout();
+    app.opts.reserve.finish(top_res_hwnd);
+    app.opts.reserve.finish(bot_res_hwnd);
+    app.update_active(unsafe { GetForegroundWindow() });
+    app.top_bar.show(false);
+    app.dock.show(false);
+    app.redraw_all();
+    app.clock.arm();
+    app.refresh_clock(); // the minute may have turned since clock_text was built
+
+    // M5: only now that the dock can launch and switch apps.
+    if app.config.taskbar.autohide_native && !app.opts.keep_taskbar {
+        app.taskbar.enable_autohide();
+    }
+    log!("ready; {}", MemSnapshot::now().describe());
+
+    APP.with(|a| *a.borrow_mut() = Some(app));
+
+    unsafe {
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    log!("message loop ended");
+    Ok(())
+}
+
+impl App {
+    pub fn scale(&self) -> f32 {
+        self.monitor.scale()
+    }
+
+    /// Reserve the edges, then place the visible windows inside the granted bands.
+    pub fn layout(&mut self) {
+        self.monitor = MonitorGeometry::primary();
+        let s = self.scale();
+        if (self.fonts.scale - s).abs() > f32::EPSILON {
+            match make_fonts(&self.gfx, s) {
+                Ok(f) => self.fonts = f,
+                Err(e) => log!("font rebuild failed: {e:?}"),
+            }
+            // Bitmaps are rendered at exact device sizes; redo them for the new scale.
+            self.active.icon = self.load_active_icon(self.active.hwnd, self.active.kind);
+            self.icons.clear();
+            self.icon_requested.clear();
+            self.sync_assets();
+        }
+
+        let top = self.top_reserve.set_pos(self.monitor.monitor, px(TOP_RESERVE, s));
+        let bottom = self.bottom_reserve.set_pos(self.monitor.monitor, px(BOTTOM_RESERVE, s));
+
+        // Horizontal span: the work area excludes a left/right native taskbar.
+        let work = win::work_area();
+        let left = work.left.max(self.monitor.monitor.left);
+        let right = work.right.min(self.monitor.monitor.right);
+        let m = px(BAR_MARGIN, s);
+        let bar = win::rect(left + m, top.top + m, (right - left - 2 * m).max(1), px(BAR_HEIGHT, s));
+
+        self.bottom_band = bottom;
+        self.span = (left, right);
+        log!(
+            "layout: dpi {} top reserve {} bottom reserve {} bar {}",
+            self.monitor.dpi,
+            win::rect_str(&top),
+            win::rect_str(&bottom),
+            win::rect_str(&bar)
+        );
+        self.top_bar.place(&self.gfx, bar);
+        self.relayout_dock();
+        if self.panel.is_some() {
+            self.close_panel();
+        }
+    }
+
+    pub fn redraw_all(&mut self) {
+        self.redraw_bar(None);
+        self.redraw_dock();
+    }
+
+    pub fn on_draw_error(&mut self, e: windows::core::Error) {
+        log!("draw failed: {e:?}");
+        if self.gfx.is_lost() {
+            self.rebuild_graphics();
+        }
+    }
+
+    /// Device loss: rebuild the shared devices and every window's composition tree, redraw once.
+    fn rebuild_graphics(&mut self) {
+        log!("graphics device lost; rebuilding");
+        let result = (|| -> Result<()> {
+            let gfx = Gfx::new()?;
+            let fonts = make_fonts(&gfx, self.scale())?;
+            for p in [&mut self.top_bar, &mut self.dock, &mut self.tooltip, &mut self.flyout] {
+                p.surface = winshell::render::WindowSurface::new(&gfx, p.hwnd)?;
+                let r = p.rect;
+                p.surface.resize(&gfx, (r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32)?;
+            }
+            self.gfx = gfx;
+            self.fonts = fonts;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            log!("graphics rebuild failed: {e:?}");
+            return;
+        }
+        // Every bitmap belonged to the old device.
+        self.active.icon = self.load_active_icon(self.active.hwnd, self.active.kind);
+        self.icons.clear();
+        self.icon_requested.clear();
+        self.media_bitmaps.clear();
+        self.sync_media_bitmaps();
+        self.sync_assets();
+        self.tooltip.hide();
+        self.close_panel();
+        self.redraw_bar(None);
+        self.redraw_dock();
+    }
+
+    // ------------------------------------------------------------------
+    // Context menus (run outside the state borrow, see MenuRequest)
+    // ------------------------------------------------------------------
+
+    pub fn on_menu_command(&mut self, ctx: MenuContext, cmd: u32) {
+        match ctx {
+            MenuContext::Dock { group_id } => self.on_dock_menu(&group_id, cmd),
+            MenuContext::ActiveWindow { hwnd } => self.on_active_menu(HWND(hwnd as _), cmd),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // System events
+    // ------------------------------------------------------------------
+
+    fn set_fullscreen(&mut self, on: bool) {
+        if self.fullscreen == on {
+            return;
+        }
+        self.fullscreen = on;
+        if on {
+            self.top_bar.hide();
+            self.dock.hide();
+            self.tooltip.hide();
+            self.close_panel();
+        } else {
+            self.top_bar.show(false);
+            self.dock.show(false);
+        }
+        log!(
+            "fullscreen app {}: bar and dock {}",
+            if on { "opened" } else { "closed" },
+            if on { "hidden" } else { "shown" }
+        );
+    }
+
+    fn on_appbar(&mut self, from: HWND, wp: WPARAM, lp: LPARAM) {
+        log!("appbar: {}", appbar::describe_notification(wp.0, lp));
+        match wp.0 as u32 {
+            ABN_POSCHANGED if from == self.top_reserve.hwnd => {
+                self.layout();
+                self.redraw_all();
+            }
+            // Both reservations get this; only act on the top one to avoid doing it twice.
+            ABN_FULLSCREENAPP if from == self.top_reserve.hwnd => self.set_fullscreen(lp.0 != 0),
+            _ => {}
+        }
+    }
+
+    /// Explorer restarted: its AppBar list is gone, so register again.
+    fn on_taskbar_created(&mut self) {
+        log!("Explorer restarted; re-registering AppBars");
+        self.top_reserve.registered = false;
+        self.bottom_reserve.registered = false;
+        self.top_reserve.register();
+        self.bottom_reserve.register();
+        self.rescan("Explorer restart");
+        self.layout();
+        self.redraw_all();
+    }
+
+    /// Resume from sleep/hibernate: clock stale, foreground and windows may differ.
+    fn on_resume(&mut self) {
+        self.resync_clock("resume");
+        self.update_active(unsafe { GetForegroundWindow() });
+        self.battery = power::battery();
+        self.net_state = self.network.state();
+        self.sysmon.refresh();
+        self.rescan("resume");
+        self.relayout_dock();
+        self.redraw_all();
+    }
+
+    fn on_audio(&mut self, devices: bool) {
+        let sound_open = self.panel_is(panel::PanelKind::Sound);
+        let Some(a) = self.audio.as_mut() else { return };
+        a.ack(devices);
+        if devices {
+            a.rebind();
+        }
+        let state = a.state();
+        let devices_now = if devices && sound_open { Some(a.render_devices()) } else { None };
+        if let Some(d) = devices_now {
+            self.devices = d;
+        }
+        if state != self.audio_state || devices {
+            self.audio_state = state;
+            self.redraw_bar(None);
+            self.refresh_panel_if(panel::PanelKind::Sound);
+        }
+    }
+
+    fn on_network(&mut self) {
+        self.network.ack();
+        let s = self.network.state();
+        if s != self.net_state {
+            self.net_state = s;
+            self.redraw_bar(None);
+        }
+    }
+
+    fn on_power_change(&mut self) {
+        let b = power::battery();
+        if b != self.battery {
+            self.battery = b;
+            self.redraw_bar(None);
+            self.refresh_panel_if(panel::PanelKind::Battery);
+        }
+    }
+
+    fn on_monitor(&mut self) {
+        let mut bar = false;
+        let mut media = false;
+        for ev in self.sysmon.drain() {
+            match ev {
+                winshell::sysmon::MonitorEvent::Bluetooth(b) => {
+                    if b != self.bluetooth {
+                        self.bluetooth = b;
+                        bar = true;
+                    }
+                }
+                winshell::sysmon::MonitorEvent::Media(m) => {
+                    self.media = m;
+                    media = true;
+                }
+            }
+        }
+        if bar {
+            self.redraw_bar(None);
+        }
+        if media {
+            self.sync_media_bitmaps();
+            self.relayout_dock();
+            self.redraw_dock();
+            self.refresh_panel_if(panel::PanelKind::Sound);
+        }
+    }
+
+    /// GPU bitmaps for album art, rebuilt only when a session's art changes.
+    fn sync_media_bitmaps(&mut self) {
+        let mut next = HashMap::new();
+        for m in &self.media {
+            let Some(art) = &m.art else { continue };
+            let key = std::sync::Arc::as_ptr(art) as usize;
+            let existing = self.media_bitmaps.get(&m.app_id).filter(|(k, _)| *k == key).map(|(_, b)| b.clone());
+            let bmp = existing.or_else(|| self.gfx.bitmap_from_bgra(art.width, art.height, &art.pixels).ok());
+            if let Some(b) = bmp {
+                next.insert(m.app_id.clone(), (key, b));
+            }
+        }
+        self.media_bitmaps = next;
+    }
+
+    pub fn media_bitmap(&self, app_id: &str) -> Option<&ID2D1Bitmap1> {
+        self.media_bitmaps.get(app_id).map(|(_, b)| b)
+    }
+
+    fn shutdown(&mut self) {
+        log!("clean exit; {}", MemSnapshot::now().describe());
+        self.taskbar.restore();
+        self.tracker.uninstall();
+        self.window_hooks.uninstall();
+        self.assets.shutdown();
+        self.sysmon.shutdown();
+        self.network.shutdown();
+        self.power_notify.unregister();
+        if let Some(a) = self.audio.as_mut() {
+            a.shutdown();
+        }
+        self.clock.disarm();
+        self.top_reserve.remove();
+        self.bottom_reserve.remove();
+        hotkey::unregister(self.top_bar.hwnd, hotkey::ID_EMERGENCY);
+        TOP_RESERVE_HWND.store(0, Ordering::SeqCst);
+        BOTTOM_RESERVE_HWND.store(0, Ordering::SeqCst);
+        for p in [&self.flyout, &self.tooltip, &self.dock, &self.top_bar] {
+            p.destroy();
+        }
+        for h in [self.top_reserve.hwnd, self.bottom_reserve.hwnd] {
+            unsafe {
+                let _ = DestroyWindow(h);
+            }
+        }
+    }
+
+    fn reserve(&self, hwnd: HWND) -> Option<&AppBar> {
+        [&self.top_reserve, &self.bottom_reserve].into_iter().find(|r| r.hwnd == hwnd)
+    }
+
+    /// The window currently in front belongs to this process (flyout, menu owner).
+    pub fn foreground_is_ours(fg: HWND) -> bool {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(fg, Some(&mut pid));
+            pid == windows::Win32::System::Threading::GetCurrentProcessId()
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Window procedure plumbing
+// ----------------------------------------------------------------------
+
+/// Run `f` on the app state, or re-post the message if the state is busy
+/// (re-entrant delivery while e.g. SHAppBarMessage or SetForegroundWindow runs).
+fn with_app<R>(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    APP.with(|a| match a.try_borrow_mut() {
+        Ok(mut g) => g.as_mut().map(f),
+        Err(_) => {
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), msg, wp, lp);
+            }
+            None
+        }
+    })
+}
+
+/// Like `with_app`, only for messages addressed to the top bar. Broadcasts
+/// (WM_TIMECHANGE, WM_POWERBROADCAST, ...) reach every top-level window.
+fn with_app_on_bar(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, f: impl FnOnce(&mut App)) {
+    with_app(hwnd, msg, wp, lp, |a| {
+        if a.top_bar.hwnd == hwnd {
+            f(a);
+        }
+    });
+}
+
+fn is_reserve(hwnd: HWND) -> bool {
+    let h = hwnd.0 as isize;
+    h != 0 && (h == TOP_RESERVE_HWND.load(Ordering::Relaxed) || h == BOTTOM_RESERVE_HWND.load(Ordering::Relaxed))
+}
+
+/// WM_SETTINGCHANGE with lParam "intl": regional format changed.
+fn is_intl_change(lp: LPARAM) -> bool {
+    if lp.0 == 0 {
+        return false;
+    }
+    let s = unsafe { PCWSTR(lp.0 as *const u16).to_string() }.unwrap_or_default();
+    s.eq_ignore_ascii_case("intl")
+}
+
+fn mouse_point(lp: LPARAM) -> (f32, f32) {
+    ((lp.0 & 0xFFFF) as i16 as f32, ((lp.0 >> 16) & 0xFFFF) as i16 as f32)
+}
+
+/// Run a context menu with no app borrow held. Returns the chosen id (0 = none).
+fn run_menu(req: &MenuRequest) -> u32 {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return 0 };
+        for (id, label) in &req.items {
+            if *id == 0 {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            } else {
+                let _ = AppendMenuW(menu, MF_STRING, *id as usize, &HSTRING::from(label.as_str()));
+            }
+        }
+        // Required for the menu to close when clicking elsewhere (Win32 menu contract).
+        let previous = GetForegroundWindow();
+        let _ = SetForegroundWindow(req.owner);
+        let align = if req.above { TPM_BOTTOMALIGN } else { TPM_TOPALIGN };
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_CENTERALIGN | align,
+            req.x,
+            req.y,
+            None,
+            req.owner,
+            None,
+        )
+        .0 as u32;
+        let _ = PostMessageW(Some(req.owner), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+        if cmd == 0 && !previous.0.is_null() {
+            let _ = SetForegroundWindow(previous);
+        }
+        cmd
+    }
+}
+
+fn track_leave(hwnd: HWND) {
+    let mut t = TRACKMOUSEEVENT {
+        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    unsafe {
+        let _ = TrackMouseEvent(&mut t);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Bar,
+    Dock,
+    Flyout,
+    Other,
+}
+
+fn which(a: &App, hwnd: HWND) -> Surface {
+    if hwnd == a.top_bar.hwnd {
+        Surface::Bar
+    } else if hwnd == a.dock.hwnd {
+        Surface::Dock
+    } else if hwnd == a.flyout.hwnd {
+        Surface::Flyout
+    } else {
+        Surface::Other
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum Button {
+    Left,
+    Middle,
+    Right,
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg != 0 && msg == TASKBAR_CREATED.get() {
+        with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_taskbar_created());
+        return LRESULT(0);
+    }
+    match msg {
+        WM_NCHITTEST if PLAN_MODE.get() && is_reserve(hwnd) => LRESULT(HTTRANSPARENT as isize),
+        WM_MOUSEACTIVATE => {
+            // The flyout takes focus; bar, dock and tooltip never do.
+            let flyout = APP.with(|a| a.try_borrow().ok().and_then(|g| g.as_ref().map(|a| a.flyout.hwnd == hwnd)));
+            if flyout == Some(true) { LRESULT(MA_ACTIVATE as isize) } else { LRESULT(MA_NOACTIVATE as isize) }
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            unsafe {
+                BeginPaint(hwnd, &mut ps);
+                let _ = EndPaint(hwnd, &ps);
+            }
+            LRESULT(0)
+        }
+        WM_HOTKEY if wp.0 as i32 == hotkey::ID_EMERGENCY => {
+            log!("emergency hotkey pressed");
+            with_app(hwnd, msg, wp, lp, |a| a.shutdown());
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let (x, y) = mouse_point(lp);
+            with_app(hwnd, msg, wp, lp, |a| {
+                let surface = which(a, hwnd);
+                let needs_track = match surface {
+                    Surface::Bar => !std::mem::replace(&mut a.top_bar.tracking_leave, true),
+                    Surface::Dock => !std::mem::replace(&mut a.dock.tracking_leave, true),
+                    Surface::Flyout => !std::mem::replace(&mut a.flyout.tracking_leave, true),
+                    Surface::Other => false,
+                };
+                if needs_track {
+                    track_leave(hwnd);
+                }
+                match surface {
+                    Surface::Bar => a.bar_mouse_move(x, y),
+                    Surface::Dock => a.dock_mouse_move(x, y),
+                    Surface::Flyout => a.panel_mouse_move(x, y),
+                    Surface::Other => {}
+                }
+            });
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with_app(hwnd, msg, wp, lp, |a| match which(a, hwnd) {
+                Surface::Bar => {
+                    a.top_bar.tracking_leave = false;
+                    a.bar_mouse_move(-1.0, -1.0);
+                }
+                Surface::Dock => {
+                    a.dock.tracking_leave = false;
+                    a.dock_mouse_move(-1.0, -1.0);
+                }
+                Surface::Flyout => {
+                    a.flyout.tracking_leave = false;
+                    a.panel_mouse_move(-1.0, -1.0);
+                }
+                Surface::Other => {}
+            });
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = mouse_point(lp);
+            with_app(hwnd, msg, wp, lp, |a| {
+                if which(a, hwnd) == Surface::Flyout {
+                    a.panel_mouse_down(x, y);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_LBUTTONUP | WM_MBUTTONUP | WM_RBUTTONUP => {
+            let (x, y) = mouse_point(lp);
+            let button = match msg {
+                WM_LBUTTONUP => Button::Left,
+                WM_MBUTTONUP => Button::Middle,
+                _ => Button::Right,
+            };
+            let menu = with_app(hwnd, msg, wp, lp, |a| match which(a, hwnd) {
+                Surface::Bar => a.bar_click(x, y, button),
+                Surface::Dock => a.dock_click(x, y, button),
+                Surface::Flyout => {
+                    if matches!(button, Button::Left) {
+                        a.panel_mouse_up(x, y);
+                    }
+                    None
+                }
+                Surface::Other => None,
+            })
+            .flatten();
+            if let Some(req) = menu {
+                let cmd = run_menu(&req);
+                if cmd != 0 {
+                    let ctx = req.context.clone();
+                    with_app(hwnd, WM_NULL, WPARAM(0), LPARAM(0), |a| a.on_menu_command(ctx, cmd));
+                }
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            with_app(hwnd, msg, wp, lp, |a| {
+                if which(a, hwnd) == Surface::Flyout {
+                    a.panel_capture_lost();
+                }
+            });
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            let inactive = (wp.0 & 0xFFFF) as u32 == WA_INACTIVE;
+            if is_reserve(hwnd) {
+                APP.with(|a| {
+                    if let Ok(g) = a.try_borrow()
+                        && let Some(r) = g.as_ref().and_then(|app| app.reserve(hwnd))
+                    {
+                        r.on_activate();
+                    }
+                });
+            } else if inactive {
+                with_app(hwnd, msg, wp, lp, |a| {
+                    if a.flyout.hwnd == hwnd {
+                        a.close_panel();
+                    }
+                });
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_KEYDOWN if wp.0 as u16 == VK_ESCAPE.0 => {
+            with_app(hwnd, msg, wp, lp, |a| a.close_panel());
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            match wp.0 {
+                TIMER_CLOCK => with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_clock_timer()),
+                TIMER_TOOLTIP_HIDE => {
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), TIMER_TOOLTIP_HIDE);
+                    }
+                    with_app(hwnd, msg, wp, lp, |a| a.hide_tooltip());
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_SHELL_FOREGROUND => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_foreground());
+            LRESULT(0)
+        }
+        WM_SHELL_TITLE => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_title());
+            LRESULT(0)
+        }
+        WM_SHELL_WINDOWS => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_window_events());
+            LRESULT(0)
+        }
+        WM_SHELL_ASSET => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_assets());
+            LRESULT(0)
+        }
+        WM_SHELL_AUDIO => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_audio(wp.0 == AUDIO_DEVICES_CHANGED));
+            LRESULT(0)
+        }
+        WM_SHELL_NETWORK => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_network());
+            LRESULT(0)
+        }
+        WM_SHELL_MONITOR => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_monitor());
+            LRESULT(0)
+        }
+        WM_TIMECHANGE => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.resync_clock("WM_TIMECHANGE"));
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE if is_intl_change(lp) => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| {
+                a.clock_text.clear(); // force a redraw in the new format
+                a.refresh_clock();
+                a.refresh_panel_if(panel::PanelKind::Calendar);
+            });
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            match wp.0 as u32 {
+                PBT_APMRESUMEAUTOMATIC => with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_resume()),
+                PBT_POWERSETTINGCHANGE | PBT_APMPOWERSTATUSCHANGE => {
+                    with_app_on_bar(hwnd, msg, wp, lp, |a| a.on_power_change())
+                }
+                _ => {}
+            }
+            LRESULT(1)
+        }
+        WM_APPBAR_CALLBACK => {
+            with_app(hwnd, msg, wp, lp, |a| a.on_appbar(hwnd, wp, lp));
+            LRESULT(0)
+        }
+        WM_WINDOWPOSCHANGED if is_reserve(hwnd) => {
+            APP.with(|a| {
+                if let Ok(g) = a.try_borrow()
+                    && let Some(r) = g.as_ref().and_then(|app| app.reserve(hwnd))
+                {
+                    r.on_window_pos_changed();
+                }
+            });
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_DPICHANGED | WM_DISPLAYCHANGE => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| {
+                if msg == WM_DISPLAYCHANGE {
+                    a.rescan("display change");
+                }
+                a.layout();
+                a.redraw_all();
+            });
+            LRESULT(0)
+        }
+        WM_CLOSE => LRESULT(0),
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}

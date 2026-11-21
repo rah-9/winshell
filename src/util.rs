@@ -59,9 +59,61 @@ pub fn normalize_to_premultiplied(px: &mut [u8]) {
     }
 }
 
+/// Dominant tint of premultiplied BGRA pixels for the media card background:
+/// a saturation-weighted average that ignores near-transparent pixels, so a
+/// colourful cover gives its main colour rather than muddy grey.
+/// Returns 0xRRGGBB, or `None` if nothing is opaque enough.
+pub fn dominant_tint(px: &[u8]) -> Option<u32> {
+    let (mut r, mut g, mut b, mut wsum) = (0f64, 0f64, 0f64, 0f64);
+    for p in px.chunks_exact(4) {
+        let a = p[3] as f64;
+        if a < 128.0 {
+            continue;
+        }
+        let (pb, pg, pr) = (p[0] as f64 * 255.0 / a, p[1] as f64 * 255.0 / a, p[2] as f64 * 255.0 / a);
+        let max = pr.max(pg).max(pb);
+        let min = pr.min(pg).min(pb);
+        let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
+        let w = 0.05 + sat * sat;
+        r += pr * w;
+        g += pg * w;
+        b += pb * w;
+        wsum += w;
+    }
+    if wsum == 0.0 {
+        return None;
+    }
+    let c = |v: f64| ((v / wsum).round().clamp(0.0, 255.0)) as u32;
+    Some((c(r) << 16) | (c(g) << 8) | c(b))
+}
+
+/// Scale an 0xRRGGBB colour's brightness (for readable dark card backgrounds).
+pub fn darken(rgb: u32, factor: f32) -> u32 {
+    let f = |shift: u32| ((((rgb >> shift) & 0xFF) as f32 * factor).round().clamp(0.0, 255.0)) as u32;
+    (f(16) << 16) | (f(8) << 8) | f(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tint_prefers_saturated_colour() {
+        // 3 grey pixels and 1 strong red pixel (BGRA, opaque).
+        let px = [128, 128, 128, 255, 128, 128, 128, 255, 128, 128, 128, 255, 0, 0, 255, 255];
+        let t = dominant_tint(&px).unwrap();
+        assert!((t >> 16) & 0xFF > 200, "red channel dominates: {t:06x}");
+    }
+
+    #[test]
+    fn tint_ignores_transparent() {
+        assert_eq!(dominant_tint(&[0, 0, 0, 0, 10, 10, 10, 20]), None);
+    }
+
+    #[test]
+    fn darken_scales_channels() {
+        assert_eq!(darken(0x804020, 0.5), 0x402010);
+    }
 
     #[test]
     fn normalize_opaque_when_no_alpha() {
