@@ -31,6 +31,7 @@ pub enum MediaPart {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockHit {
     Start,
+    Scroll(i32),
     /// Index into `DockModel::groups()`.
     App(usize),
     Media(MediaPart),
@@ -40,8 +41,6 @@ pub enum DockHit {
 pub struct MediaLayout {
     pub pill: D2D_RECT_F,
     pub art: D2D_RECT_F,
-    pub title: D2D_RECT_F,
-    pub artist: D2D_RECT_F,
     pub play: D2D_RECT_F,
 }
 
@@ -49,6 +48,8 @@ pub struct MediaLayout {
 #[derive(Clone, Default)]
 pub struct DockLayout {
     pub width: f32,
+    pub height: f32,
+    pub navigation: Vec<(i32, D2D_RECT_F)>,
     pub start: D2D_RECT_F,
     pub apps: Vec<(usize, D2D_RECT_F)>,
     pub separators: Vec<f32>,
@@ -66,6 +67,9 @@ impl DockLayout {
         }
         if let Some((gi, _)) = self.apps.iter().find(|(_, r)| inside(r, x, y)) {
             return Some(DockHit::App(*gi));
+        }
+        if let Some((step, _)) = self.navigation.iter().find(|(_, r)| inside(r, x, y)) {
+            return Some(DockHit::Scroll(*step));
         }
         let m = self.media.as_ref()?;
         if inside(&m.play, x, y) {
@@ -110,6 +114,50 @@ fn paint_start_glyph(dc: &ID2D1DeviceContext, slot: D2D_RECT_F, s: f32) -> Resul
     Ok(())
 }
 
+fn build_rail(s: f32, pinned: usize, count: usize, offset: usize, max_apps: usize, media: bool) -> DockLayout {
+    let slot = DOCK_SLOT * s;
+    let x = DOCK_PAD * s;
+    let mut y = DOCK_PAD * s;
+    let mut l = DockLayout { width: (DOCK_WIDTH * s).round(), ..Default::default() };
+    l.start = rectf(x, y, slot, slot);
+    y += slot;
+    let mut section = None;
+    for gi in (offset..count).take(max_apps) {
+        let this = if gi < pinned { 0 } else { 1 };
+        if section != Some(this) {
+            y += DOCK_SEPARATOR_MARGIN * s;
+            l.separators.push(y.round());
+            y += 1.0 + DOCK_SEPARATOR_MARGIN * s;
+        } else {
+            y += DOCK_SLOT_GAP * s;
+        }
+        l.apps.push((gi, rectf(x, y.round(), slot, slot)));
+        y += slot;
+        section = Some(this);
+    }
+    if offset > 0 || offset + l.apps.len() < count {
+        y += 4.0 * s;
+        for step in [-1, 1] {
+            l.navigation.push((step, rectf(x, y, slot, 20.0 * s)));
+            y += 20.0 * s;
+        }
+    }
+    if media {
+        y += DOCK_SEPARATOR_MARGIN * s;
+        l.separators.push(y.round());
+        y += DOCK_SEPARATOR_MARGIN * s;
+        let art_sz = MEDIA_ART * s;
+        let art = rectf((l.width - art_sz) / 2.0, y + 4.0 * s, art_sz, art_sz);
+        let btn = MEDIA_BUTTON * s;
+        let play = rectf((l.width - btn) / 2.0, art.bottom + 2.0 * s, btn, btn);
+        let pill = rectf(x, y, slot, play.bottom - y + 4.0 * s);
+        l.media = Some(MediaLayout { pill, art, play });
+        y = pill.bottom;
+    }
+    l.height = (y + DOCK_PAD * s).ceil();
+    l
+}
+
 impl App {
     // ------------------------------------------------------------------
     // Model upkeep (M3)
@@ -140,6 +188,7 @@ impl App {
             return;
         }
         // A window can become dock-eligible late (e.g. it gets its title after showing).
+        self.check_pending_launch(fg);
         let root = apps::root_owner(fg);
         let mut changed = match apps::window_entry(root) {
             Some(e) => self.dock_model.upsert(e),
@@ -170,6 +219,7 @@ impl App {
             }
         }
         let fg = unsafe { GetForegroundWindow() };
+        self.check_pending_launch(fg);
         if !App::foreground_is_ours(fg) {
             changed |= self.dock_model.set_focused(apps::root_owner(fg).0 as isize);
         }
@@ -277,93 +327,54 @@ impl App {
     }
 
     fn build_dock_layout(&self, max_apps: usize) -> DockLayout {
-        let s = self.scale();
-        let slot = DOCK_SLOT * s;
-        let gap = DOCK_SLOT_GAP * s;
-        let sep_m = DOCK_SEPARATOR_MARGIN * s;
-        let dh = px(DOCK_HEIGHT, s) as f32;
-        let y = ((dh - slot) / 2.0).round();
-        let mut l = DockLayout::default();
-        let mut x = DOCK_PAD_X * s;
-
-        l.start = rectf(x, y, slot, slot);
-        x += slot;
-
-        let pinned = self.dock_model.pinned_count();
-        let mut section = None;
-        for gi in 0..self.dock_model.groups().len().min(max_apps) {
-            let this = if gi < pinned { 0 } else { 1 };
-            if section != Some(this) {
-                x += sep_m;
-                l.separators.push(x.round());
-                x += 1.0 + sep_m;
-            } else {
-                x += gap;
-            }
-            l.apps.push((gi, rectf(x.round(), y, slot, slot)));
-            x += slot;
-            section = Some(this);
-        }
-
-        if self.media_visible() {
-            x += sep_m;
-            l.separators.push(x.round());
-            x += 1.0 + sep_m;
-            let h = MEDIA_PILL_H * s;
-            let py = ((dh - h) / 2.0).round();
-            let w = (6.0 + MEDIA_ART + 8.0 + MEDIA_TEXT_W + MEDIA_BUTTON + 6.0) * s;
-            let pill = rectf(x.round(), py, w.round(), h);
-            let art_sz = MEDIA_ART * s;
-            let art = rectf(pill.left + 6.0 * s, (py + (h - art_sz) / 2.0).round(), art_sz, art_sz);
-            let tx = art.right + 8.0 * s;
-            let tw = MEDIA_TEXT_W * s;
-            let title = rectf(tx, py + 6.0 * s, tw, 20.0 * s);
-            let artist = rectf(tx, py + 24.0 * s, tw, 18.0 * s);
-            let b = MEDIA_BUTTON * s;
-            let play = rectf(pill.right - 6.0 * s - b, (py + (h - b) / 2.0).round(), b, b);
-            l.media = Some(MediaLayout { pill, art, title, artist, play });
-            x = pill.right;
-        }
-
-        l.width = (x + DOCK_PAD_X * s).ceil();
-        l
+        build_rail(
+            self.scale(),
+            self.dock_model.pinned_count(),
+            self.dock_model.groups().len(),
+            self.dock_scroll,
+            max_apps,
+            self.media_visible(),
+        )
     }
 
-    /// The widest layout that fits the usable span; extra running apps are dropped from the end.
     fn fitting_dock_layout(&self) -> DockLayout {
-        let s = self.scale();
-        let avail = (self.span.1 - self.span.0 - 2 * px(BAR_MARGIN, s)) as f32;
-        let n = self.dock_model.groups().len();
+        let avail = (self.dock_area.bottom - self.dock_area.top) as f32;
+        let n = self
+            .dock_model
+            .groups()
+            .len()
+            .saturating_sub(self.dock_scroll)
+            .min((avail / (DOCK_SLOT * self.scale())).max(0.0) as usize);
         let full = self.build_dock_layout(n);
-        if full.width <= avail {
+        if full.height <= avail {
             return full;
         }
-        // Width grows with the number of apps: binary-search the largest count that fits
-        // (O(n log n), so a process spawning many windows cannot stall the UI: review F7).
         let (mut lo, mut hi) = (0usize, n);
         while lo < hi {
             let mid = (lo + hi).div_ceil(2);
-            if self.build_dock_layout(mid).width <= avail { lo = mid } else { hi = mid - 1 }
+            if self.build_dock_layout(mid).height <= avail { lo = mid } else { hi = mid - 1 }
         }
-        log!("dock: {lo} of {n} apps fit");
         self.build_dock_layout(lo)
     }
 
-    /// The dock window resizes as apps come and go; the reservation never does.
     pub fn relayout_dock(&mut self) {
+        self.dock_scroll = self.dock_scroll.min(self.dock_model.groups().len().saturating_sub(1));
+        self.dock_hover = None;
+        self.hide_tooltip();
         self.dock_layout = self.fitting_dock_layout();
-        let s = self.scale();
-        let (left, right) = self.span;
         let w = self.dock_layout.width as i32;
-        let h = px(DOCK_HEIGHT, s);
-        let r = win::rect(left + (right - left - w) / 2, self.bottom_band.bottom - px(DOCK_MARGIN_BOTTOM, s) - h, w, h);
+        let h = self.dock_layout.height as i32;
+        let area = self.dock_area;
+        let r = win::rect(area.left, area.top + ((area.bottom - area.top - h) / 2).max(0), w, h);
         self.dock.place(&self.gfx, r);
-        if let Some(DockHit::App(gi)) = self.dock_hover
-            && gi >= self.dock_model.groups().len()
-        {
-            self.dock_hover = None;
-            self.hide_tooltip();
-        }
+        self.update_visibility();
+    }
+
+    pub fn scroll_dock(&mut self, step: i32) {
+        let max = self.dock_model.groups().len().saturating_sub(self.dock_layout.apps.len().max(1));
+        self.dock_scroll = self.dock_scroll.saturating_add_signed(step as isize).min(max);
+        self.relayout_dock();
+        self.redraw_dock();
     }
 
     // ------------------------------------------------------------------
@@ -401,9 +412,25 @@ impl App {
         }
         paint_start_glyph(dc, l.start, s)?;
 
-        let sep_h = DOCK_SEPARATOR_HEIGHT * s;
-        for x in &l.separators {
-            render::fill_round(dc, rectf(*x, ((dh - sep_h) / 2.0).round(), 1.0, sep_h), 0.0, pal().border)?;
+        for y in &l.separators {
+            render::fill_round(dc, rectf(10.0 * s, *y, dw - 20.0 * s, 1.0), 0.0, pal().border)?;
+        }
+        for (step, r) in &l.navigation {
+            let enabled = if *step < 0 {
+                self.dock_scroll > 0
+            } else {
+                self.dock_scroll + l.apps.len() < self.dock_model.groups().len()
+            };
+            if self.dock_hover == Some(DockHit::Scroll(*step)) {
+                hover_bg(*r)?;
+            }
+            render::glyph(
+                dc,
+                if *step < 0 { glyph::CHEVRON_UP } else { glyph::CHEVRON_DOWN },
+                &self.fonts.icon_small,
+                *r,
+                if enabled { pal().text_primary } else { pal().text_disabled },
+            )?;
         }
 
         let focused = self.dock_model.focused();
@@ -419,37 +446,27 @@ impl App {
                 if hovered && self.config.dock.magnification { (base * DOCK_HOVER_SCALE).round() } else { base };
             let cx = (slot.left + slot.right) / 2.0;
             let cy = (slot.top + slot.bottom) / 2.0;
-            // Magnified icons grow upwards so they stay clear of the indicators.
-            let grow = icon_sz - base;
-            let dest = rectf((cx - icon_sz / 2.0).round(), (cy - base / 2.0 - grow).round(), icon_sz, icon_sz);
+            // Icons grow inward, clear of the running indicators at the left edge.
+            let dest = rectf((cx - base / 2.0).round(), (cy - icon_sz / 2.0).round(), icon_sz, icon_sz);
             match &bitmaps[i] {
                 Some(bmp) => render::draw_bitmap(dc, bmp, dest)?,
                 None => render::fill_round(dc, dest, pal().icon_slot_radius * s, pal().pill_bg)?,
             }
             if g.windows.iter().any(|w| w.is_elevated) {
-                let b = 16.0 * s;
+                let b = 12.0 * s;
                 let badge = rectf(dest.right - b + 2.0 * s, dest.bottom - b + 2.0 * s, b, b);
                 render::fill_round(dc, badge, b / 2.0, (pal().glass_bg & 0xFFFFFF00) | 0xE6)?;
                 render::glyph(dc, glyph::ADMIN, &self.fonts.icon_small, badge, pal().warning)?;
             }
 
-            // Below the slot: focused pill, else multi-window dots, else running dot.
-            if !g.is_running() {
-                continue;
-            }
-            let iy = slot.bottom + INDICATOR_GAP * s;
-            if focused == Some(*gi) {
-                let (w, h) = (FOCUS_PILL_W * s, FOCUS_PILL_H * s);
-                render::fill_round(dc, rectf(cx - w / 2.0, iy, w, h), h / 2.0, pal().accent)?;
-            } else if g.windows.len() > 1 {
-                let d = MULTI_DOT * s;
-                let gap = INDICATOR_GAP * s;
-                let x0 = cx - d - gap / 2.0;
-                render::fill_round(dc, rectf(x0, iy, d, d), d / 2.0, pal().running_dot)?;
-                render::fill_round(dc, rectf(x0 + d + gap, iy, d, d), d / 2.0, pal().running_dot)?;
-            } else {
-                let d = RUNNING_DOT * s;
-                render::fill_round(dc, rectf(cx - d / 2.0, iy, d, d), d / 2.0, pal().running_dot)?;
+            if g.is_running() {
+                let x = 2.0 * s;
+                let (w, h, c) = if focused == Some(*gi) {
+                    (2.0 * s, 14.0 * s, pal().accent)
+                } else {
+                    (2.0 * s, if g.windows.len() > 1 { 7.0 } else { 3.0 } * s, pal().running_dot)
+                };
+                render::fill_round(dc, rectf(x, cy - h / 2.0, w, h), w / 2.0, c)?;
             }
         }
 
@@ -464,9 +481,6 @@ impl App {
                     render::glyph(dc, glyph::MUSIC, &self.fonts.icon, m.art, pal().text_secondary)?;
                 }
             }
-            let title = if session.title.is_empty() { "Unknown title" } else { session.title.as_str() };
-            render::text(dc, title, &self.fonts.body_bold, m.title, pal().text_primary)?;
-            render::text(dc, &session.artist, &self.fonts.sub, m.artist, pal().text_secondary)?;
             if self.dock_hover == Some(DockHit::Media(MediaPart::PlayPause)) {
                 render::fill_round(dc, m.play, (MEDIA_BUTTON * s) / 2.0, pal().pill_hover)?;
             }
@@ -484,11 +498,13 @@ impl App {
     /// Show `text` in the capsule tooltip centred above `anchor` (dock surface coordinates).
     fn show_tooltip_at(&mut self, text: &str, anchor: D2D_RECT_F) {
         let s = self.scale();
-        let w = (self.gfx.measure(text, &self.fonts.pill) + 2.0 * TOOLTIP_PAD_X * s).ceil() as i32;
+        let available = (self.monitor.monitor.right - self.dock.rect.right - px(TOOLTIP_GAP + 8.0, s)).max(1);
+        let w = ((self.gfx.measure(text, &self.fonts.pill) + 2.0 * TOOLTIP_PAD_X * s).ceil() as i32).min(available);
         let h = px(TOOLTIP_H, s);
-        let cx = self.dock.rect.left + ((anchor.left + anchor.right) / 2.0) as i32;
-        let x = (cx - w / 2).clamp(self.span.0, (self.span.1 - w).max(self.span.0));
-        let y = self.dock.rect.top - px(TOOLTIP_GAP, s) - h;
+        let x = self.dock.rect.right + px(TOOLTIP_GAP, s);
+        let cy = self.dock.rect.top + ((anchor.top + anchor.bottom) / 2.0) as i32;
+        let y = (cy - h / 2)
+            .clamp(self.monitor.monitor.top, (self.monitor.monitor.bottom - h).max(self.monitor.monitor.top));
         self.tooltip.place(&self.gfx, win::rect(x, y, w, h));
         self.tooltip_text = text.to_string();
         let radius = self.opts.style.corners.approx_radius() * s;
@@ -551,6 +567,7 @@ impl App {
         self.redraw_dock();
         match hit {
             Some(DockHit::Start) => self.show_tooltip_at("Start", self.dock_layout.start),
+            Some(DockHit::Scroll(_)) => self.hide_tooltip(),
             Some(DockHit::App(gi)) => {
                 if let (Some(g), Some(slot)) = (self.dock_model.groups().get(gi), self.dock_layout.slot(gi)) {
                     let mut name = group_name(g);
@@ -574,6 +591,10 @@ impl App {
         let hit = self.dock_layout.hit(x, y)?;
         self.hide_tooltip();
         match (hit, button) {
+            (DockHit::Scroll(step), Button::Left) => {
+                self.scroll_dock(step);
+                None
+            }
             (DockHit::Start, Button::Left) => {
                 self.close_panel();
                 actions::open_start();
@@ -624,19 +645,14 @@ impl App {
         let iconic = unsafe { IsIconic(hwnd).as_bool() };
         if fg == hwnd && !iconic {
             actions::minimize(hwnd);
-        } else if !actions::activate(hwnd) {
-            let msg = if elevated {
-                "This is an administrator window: switch to it with Alt+Tab"
-            } else {
-                "Windows didn't allow switching to that window"
-            };
-            self.show_message_tooltip(msg);
+        } else {
+            self.present_window(hwnd, elevated);
         }
     }
 
     fn launch_group(&mut self, gi: usize) {
         let Some(g) = self.dock_model.groups().get(gi).cloned() else { return };
-        if !actions::launch(&g.exe_path, g.aumid.as_deref()) {
+        if !self.launch_app(&g.exe_path, g.aumid.as_deref(), &g.id) {
             self.show_message_tooltip(&format!("Couldn't start {}", group_name(&g)));
         }
     }
@@ -656,9 +672,9 @@ impl App {
         }
         Some(MenuRequest {
             owner: self.dock.hwnd,
-            x: self.dock.rect.left + ((slot.left + slot.right) / 2.0) as i32,
-            y: self.dock.rect.top - px(4.0, self.scale()),
-            above: true,
+            x: self.dock.rect.right + px(8.0, self.scale()),
+            y: self.dock.rect.top + slot.top as i32,
+            above: false,
             items,
             context: MenuContext::Dock { group_id: g.id.clone() },
         })
@@ -716,5 +732,40 @@ impl App {
         log!("{} {entry}", if pin { "pinned" } else { "unpinned" });
         self.load_pins();
         self.dock_changed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rail_keeps_icons_inside_thin_bounds_at_supported_scales() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let l = build_rail(scale, 3, 10, 0, 10, true);
+            assert_eq!(l.width, (48.0 * scale).round());
+            for (_, r) in &l.apps {
+                assert!(r.left >= 0.0 && r.right <= l.width);
+                assert!(r.top >= l.start.bottom && r.bottom <= l.height);
+            }
+            let media = l.media.unwrap();
+            assert!(media.play.bottom < l.height);
+            assert!(inside(&media.pill, media.art.left, media.art.top));
+        }
+    }
+    #[test]
+    fn overflow_navigation_can_reach_every_app_without_losing_pin_order() {
+        let mut seen = std::collections::HashSet::new();
+        for offset in 0..=95 {
+            let l = build_rail(1.0, 3, 100, offset, 5, false);
+            assert_eq!(l.navigation.len(), 2);
+            assert!(l.height < 400.0);
+            for (index, _) in l.apps {
+                seen.insert(index);
+            }
+        }
+        assert_eq!(seen.len(), 100);
+        let l = build_rail(1.0, 3, 3, 0, 3, false);
+        assert!(l.navigation.is_empty());
+        assert_eq!(l.apps.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 1, 2]);
     }
 }

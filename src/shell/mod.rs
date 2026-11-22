@@ -16,6 +16,7 @@
 mod autohide;
 mod bar;
 mod dock;
+mod immersive;
 mod panel;
 mod popup;
 mod theme;
@@ -30,7 +31,7 @@ use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_F};
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, Result, w};
@@ -67,6 +68,7 @@ const TOPBAR_CLASS: PCWSTR = w!("WinShellTheme_TopBarClass");
 const WINDOW_CLASS: PCWSTR = w!("WinShellTheme_Window");
 const FLYOUT_CLASS: PCWSTR = w!("WinShellTheme_FlyoutClass");
 
+const HOTKEY_IMMERSIVE: i32 = 0x5746;
 const TIMER_CLOCK: usize = 1;
 const TIMER_TOOLTIP_HIDE: usize = 2;
 const TIMER_AUTOHIDE_BAR: usize = 3;
@@ -93,7 +95,7 @@ const USAGE: &str = "WinShellTheme (winshell.exe)
   winshell.exe --disable-autostart  stop starting with Windows
   winshell.exe --help
 
-Start options: --no-taskbar, --reserve layered|hidden|plan,
+Start options: --preview, --no-taskbar, --reserve layered|hidden|plan,
                --backdrop acrylic|mica|tabbed|none, --corners round|small|none";
 
 const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
@@ -111,6 +113,8 @@ thread_local! {
 }
 
 pub struct Options {
+    /// Visible, targetable surfaces for development / visual QA. Never touches the taskbar.
+    preview: bool,
     reserve: ReserveMode,
     style: DwmStyle,
     /// `--no-taskbar`: never touch the native taskbar this run.
@@ -122,6 +126,7 @@ pub struct Options {
 impl Options {
     fn from_args() -> std::result::Result<Self, String> {
         let mut o = Options {
+            preview: false,
             reserve: ReserveMode::Layered,
             style: DwmStyle::default(),
             keep_taskbar: false,
@@ -138,6 +143,10 @@ impl Options {
                     o.corners_override = true;
                 }
                 "--no-taskbar" => o.keep_taskbar = true,
+                "--preview" => {
+                    o.preview = true;
+                    o.keep_taskbar = true;
+                }
                 "--autostart" => {}
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -163,9 +172,9 @@ fn make_fonts(gfx: &Gfx, scale: f32) -> Result<Fonts> {
     let ui = w!("Segoe UI Variable");
     let icons = if gfx.font_exists("Segoe Fluent Icons") { w!("Segoe Fluent Icons") } else { w!("Segoe MDL2 Assets") };
     Ok(Fonts {
-        title: gfx.text_format_ellipsis(ui, 13.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
-        pill: gfx.text_format(ui, 12.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
-        icon: gfx.text_format(icons, 16.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
+        title: gfx.text_format_ellipsis(ui, 12.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
+        pill: gfx.text_format(ui, 11.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
+        icon: gfx.text_format(icons, 14.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
         icon_small: gfx.text_format(icons, 12.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
         header: gfx.text_format_ellipsis(ui, 14.0 * scale, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
         body: gfx.text_format_ellipsis(ui, 13.0 * scale, DWRITE_FONT_WEIGHT_NORMAL)?,
@@ -192,6 +201,7 @@ pub struct MenuRequest {
 pub enum MenuContext {
     Dock { group_id: String },
     ActiveWindow { hwnd: isize },
+    Shell,
 }
 
 pub struct App {
@@ -226,10 +236,12 @@ pub struct App {
     /// Apps whose icon lookup failed (not retried until a rescan).
     pub icon_failed: HashSet<String>,
     pub app_names: HashMap<String, String>,
-    pub bottom_band: RECT,
+    pub dock_area: RECT,
     pub span: (i32, i32),
     pub dock_layout: DockLayout,
     pub dock_hover: Option<DockHit>,
+    pub dock_scroll: usize,
+    pub pending_launches: Vec<(String, String, std::time::Instant)>,
     pub tooltip_text: String,
     // M5
     pub taskbar: TaskbarGuard,
@@ -296,6 +308,7 @@ pub fn main() {
 
     // M5 step 1: repair the taskbar if the previous run died, before anything else.
     let taskbar = TaskbarGuard::repair(dir.join("taskbar_state.toml"));
+    immersive::repair();
 
     let config_path = dir.join("config.toml");
     let (config, err) = config::load_or_create(&config_path);
@@ -328,6 +341,7 @@ fn install_panic_hook(path: PathBuf) {
 /// Panic / fatal paths: restore the taskbar from its state file and remove the
 /// AppBars using only stored handles (the app state may be unreachable).
 fn cleanup_raw() {
+    immersive::restore_all();
     taskbar::restore_from_file();
     for slot in [&TOP_RESERVE_HWND, &BOTTOM_RESERVE_HWND] {
         let h = slot.swap(0, Ordering::SeqCst);
@@ -426,9 +440,12 @@ fn run_command_line(dir: &std::path::Path) -> Option<i32> {
 fn ensure_theme_files(dir: &std::path::Path) {
     let themes = dir.join("themes");
     let _ = std::fs::create_dir_all(&themes);
-    for (name, text) in
-        [("dark_glass.toml", theme_file::DARK_GLASS_TOML), ("light_clean.toml", theme_file::LIGHT_CLEAN_TOML)]
-    {
+    for (name, text) in [
+        ("dark_glass.toml", theme_file::DARK_GLASS_TOML),
+        ("light_clean.toml", theme_file::LIGHT_CLEAN_TOML),
+        ("midnight.toml", theme_file::MIDNIGHT_TOML),
+        ("pearl.toml", theme_file::PEARL_TOML),
+    ] {
         let p = themes.join(name);
         if !p.exists() {
             let _ = std::fs::write(p, text);
@@ -445,11 +462,15 @@ fn resolve_palette(config: &Config, dir: &std::path::Path) -> Palette {
     let name = if follow {
         if winshell::registry::apps_use_light_theme() { "light_clean".to_string() } else { "dark_glass".to_string() }
     } else if g.theme.trim().is_empty() {
-        "dark_glass".to_string()
+        "midnight".to_string()
     } else {
         g.theme.trim().to_string()
     };
-    let base = if name.eq_ignore_ascii_case("light_clean") { theme_file::LIGHT_CLEAN } else { theme_file::DARK_GLASS };
+    let base = if name.eq_ignore_ascii_case("light_clean") || name.eq_ignore_ascii_case("pearl") {
+        theme_file::LIGHT_CLEAN
+    } else {
+        theme_file::DARK_GLASS
+    };
     if !theme_file::valid_theme_name(&name) {
         log!("theme: \"{name}\" is not a valid theme name (letters, digits, _ and - only); using built-in");
         return base;
@@ -511,17 +532,23 @@ fn run(mut opts: Options, config: Config, config_path: PathBuf, taskbar: Taskbar
     let gfx = Gfx::new()?;
     log!("graphics: shared devices created ({})", gfx.driver);
 
-    let bar_ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+    let bar_ex = WS_EX_NOREDIRECTIONBITMAP
+        | WS_EX_TOPMOST
+        | if opts.preview { WS_EX_APPWINDOW } else { WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE };
     // The hotkey is registered on the first window, before anything can get stuck on screen.
     let top_bar = Popup::create(&gfx, TOPBAR_CLASS, w!("WinShellTheme TopBar"), bar_ex, opts.style)?;
     match hotkey::register_emergency(top_bar.hwnd) {
         Some(c) => log!("emergency hotkey: {c}"),
         None => log!("WARNING: emergency hotkey unavailable (Esc and F12 combinations both taken)"),
     }
+    if !hotkey::register(top_bar.hwnd, HOTKEY_IMMERSIVE, VK_F) {
+        log!("Ctrl+Shift+Alt+F unavailable; use the active window menu to restore immersive windows");
+    }
     let dock = Popup::create(&gfx, WINDOW_CLASS, w!("WinShellTheme Dock"), bar_ex, opts.style)?;
     let tooltip = Popup::create(&gfx, WINDOW_CLASS, w!("WinShellTheme Tooltip"), bar_ex, opts.style)?;
     // The flyout takes focus so it can close when you click elsewhere (WA_INACTIVE) or press Esc.
-    let flyout_ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+    let flyout_ex =
+        WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | if opts.preview { WS_EX_APPWINDOW } else { WS_EX_TOOLWINDOW };
     let flyout = Popup::create(&gfx, FLYOUT_CLASS, w!("WinShellTheme Flyout"), flyout_ex, opts.style)?;
 
     let zero = win::rect(0, 0, 1, 1);
@@ -571,10 +598,12 @@ fn run(mut opts: Options, config: Config, config_path: PathBuf, taskbar: Taskbar
         icon_requested: HashSet::new(),
         icon_failed: HashSet::new(),
         app_names: HashMap::new(),
-        bottom_band: zero,
+        dock_area: zero,
         span: (0, 1),
         dock_layout: DockLayout::default(),
         dock_hover: None,
+        dock_scroll: 0,
+        pending_launches: Vec::new(),
         tooltip_text: String::new(),
         taskbar,
         audio_state: audio.as_ref().map(|a| a.state()).unwrap_or_default(),
@@ -619,6 +648,8 @@ fn run(mut opts: Options, config: Config, config_path: PathBuf, taskbar: Taskbar
     // M5: only now that the dock can launch and switch apps.
     if app.config.taskbar.autohide_native && !app.opts.keep_taskbar {
         app.taskbar.enable_autohide();
+        app.layout();
+        app.redraw_all();
     }
     log!("ready; {}", MemSnapshot::now().describe());
 
@@ -657,25 +688,27 @@ impl App {
             self.sync_assets();
         }
 
-        let top = self.top_reserve.set_pos(self.monitor.monitor, px(TOP_RESERVE, s));
-        let bottom = self.bottom_reserve.set_pos(self.monitor.monitor, px(BOTTOM_RESERVE, s));
-
-        // Horizontal span: the work area excludes a left/right native taskbar.
+        // Overlays never reserve desktop space. Immersive apps use the monitor,
+        // while the desktop rail stays clear of the native taskbar in --no-taskbar mode.
+        let screen = self.monitor.monitor;
         let work = win::work_area();
-        let left = work.left.max(self.monitor.monitor.left);
-        let right = work.right.min(self.monitor.monitor.right);
         let m = px(BAR_MARGIN, s);
-        let bar = win::rect(left + m, top.top + m, (right - left - 2 * m).max(1), px(BAR_HEIGHT, s));
-
-        self.bottom_band = bottom;
-        self.span = (left, right);
+        let bar =
+            win::rect(screen.left + m, screen.top + m, (screen.right - screen.left - 2 * m).max(1), px(BAR_HEIGHT, s));
+        let margin = px(DOCK_MARGIN, s);
+        self.dock_area = RECT {
+            left: work.left.max(screen.left) + margin,
+            right: screen.right - margin,
+            top: work.top.max(bar.bottom) + margin,
+            bottom: work.bottom.min(screen.bottom) - margin,
+        };
+        self.span = (screen.left, screen.right);
         self.place_edges();
         log!(
-            "layout: dpi {} top reserve {} bottom reserve {} bar {}",
+            "layout: dpi {} bar {} rail area {}",
             self.monitor.dpi,
-            win::rect_str(&top),
-            win::rect_str(&bottom),
-            win::rect_str(&bar)
+            win::rect_str(&bar),
+            win::rect_str(&self.dock_area)
         );
         self.top_bar.place(&self.gfx, bar);
         self.relayout_dock();
@@ -737,6 +770,7 @@ impl App {
         match ctx {
             MenuContext::Dock { group_id } => self.on_dock_menu(&group_id, cmd),
             MenuContext::ActiveWindow { hwnd } => self.on_active_menu(HWND(hwnd as _), cmd),
+            MenuContext::Shell => self.on_shell_menu(cmd),
         }
     }
 
@@ -786,6 +820,7 @@ impl App {
         self.bottom_reserve.registered = false;
         self.sync_reservations();
         self.rescan("Explorer restart");
+        immersive::reflow();
         self.layout();
         self.redraw_all();
     }
@@ -942,6 +977,10 @@ impl App {
     fn apply_settings(&mut self, new: Config) {
         let pins_changed = new.dock.pinned_apps != self.config.dock.pinned_apps;
         let autohide_changed = new.taskbar.autohide_native != self.config.taskbar.autohide_native;
+        if self.config.dock.immersive && !new.dock.immersive {
+            immersive::restore_all();
+            self.pending_launches.clear();
+        }
         self.config = new;
         self.user_handle = user_handle_for(&self.config);
         if pins_changed {
@@ -983,6 +1022,7 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        immersive::restore_all();
         log!("clean exit; {}", MemSnapshot::now().describe());
         if let Some(w) = self.watcher.as_mut() {
             w.stop();
@@ -1001,6 +1041,7 @@ impl App {
         self.top_reserve.remove();
         self.bottom_reserve.remove();
         hotkey::unregister(self.top_bar.hwnd, hotkey::ID_EMERGENCY);
+        hotkey::unregister(self.top_bar.hwnd, HOTKEY_IMMERSIVE);
         TOP_RESERVE_HWND.store(0, Ordering::SeqCst);
         BOTTOM_RESERVE_HWND.store(0, Ordering::SeqCst);
         for p in [&self.flyout, &self.tooltip, &self.dock, &self.top_bar] {
@@ -1215,6 +1256,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 a.set_fullscreen(false);
                 a.layout();
                 a.redraw_all();
+            });
+            LRESULT(0)
+        }
+        WM_HOTKEY if wp.0 as i32 == HOTKEY_IMMERSIVE => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| {
+                a.toggle_immersive();
+            });
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wp.0 >> 16) & 0xFFFF) as i16;
+            with_app(hwnd, msg, wp, lp, |a| {
+                if delta != 0 {
+                    match which(a, hwnd) {
+                        Surface::Dock => a.scroll_dock(if delta > 0 { -1 } else { 1 }),
+                        Surface::Flyout => a.scroll_panel(if delta > 0 { -1.0 } else { 1.0 }),
+                        _ => {}
+                    }
+                }
             });
             LRESULT(0)
         }
@@ -1470,6 +1530,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if msg == WM_DISPLAYCHANGE {
                     a.rescan("display change");
                 }
+                immersive::reflow();
                 a.layout();
                 a.redraw_all();
             });

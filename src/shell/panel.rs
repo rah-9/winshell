@@ -31,6 +31,7 @@ const MAX_MEDIA_CARDS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PanelKind {
+    Appearance,
     Sound,
     Battery,
     Calendar,
@@ -48,6 +49,7 @@ pub enum SliderKind {
 
 #[derive(Clone, Debug, PartialEq)]
 enum PanelHit {
+    Shell(u32),
     Activate(isize, bool),
     NewWindow(String),
     ToggleMute,
@@ -106,6 +108,8 @@ pub struct PanelState {
     cal: (i32, u32),
     height: f32,
     width: f32,
+    scroll: f32,
+    content_height: f32,
 }
 
 struct Builder {
@@ -252,6 +256,7 @@ impl App {
             self.sysmon.refresh_bt_devices();
         }
         let name = match &kind {
+            PanelKind::Appearance => "appearance",
             PanelKind::Sound => "sound",
             PanelKind::Battery => "battery",
             PanelKind::Calendar => "calendar",
@@ -271,6 +276,8 @@ impl App {
             cal: (y, m),
             height: 0.0,
             width: 0.0,
+            scroll: 0.0,
+            content_height: 0.0,
         });
         self.show_panel(!was_open);
     }
@@ -321,6 +328,7 @@ impl App {
         } * s;
         let mut b = Builder { s, w: w.round(), y: FLYOUT_PAD * s, items: Vec::new(), hits: Vec::new() };
         match &p.kind {
+            PanelKind::Appearance => self.build_appearance(&mut b),
             PanelKind::Sound => self.build_sound(&mut b),
             PanelKind::Battery => self.build_battery(&mut b),
             PanelKind::Calendar => self.build_calendar(&mut b, p.cal),
@@ -330,6 +338,54 @@ impl App {
         }
         b.y += FLYOUT_PAD * s;
         b
+    }
+
+    fn build_appearance(&self, b: &mut Builder) {
+        let s = b.s;
+        b.header("Make it yours");
+        b.note("Slim glass. More room for your apps.");
+        b.divider();
+        for (cmd, name, id, color) in [
+            (10, "Midnight", "midnight", 0x98C8FFFF),
+            (11, "Pearl", "pearl", 0xEDF2F8FF),
+            (12, "Dark Glass", "dark_glass", 0x6EA8FEFF),
+            (13, "Light Clean", "light_clean", 0x2563EBFF),
+            (14, "Follow Windows", "auto_system", pal().text_secondary),
+        ] {
+            let (l, r) = b.inner();
+            let row = rectf(l, b.y, r - l, 36.0 * s);
+            let selected = self.config.general.theme.eq_ignore_ascii_case(id)
+                || (id == "auto_system" && self.config.general.follow_windows_theme);
+            if selected {
+                b.fill(row, 8.0 * s, pal().pill_hover);
+            }
+            b.fill(rectf(l + 8.0 * s, b.y + 11.0 * s, 14.0 * s, 14.0 * s), 7.0 * s, color);
+            b.text(
+                name,
+                Font::Body,
+                rectf(l + 32.0 * s, b.y, r - l - 64.0 * s, 36.0 * s),
+                pal().text_primary,
+                Align::Leading,
+            );
+            if selected {
+                b.glyph('\u{E73E}', rectf(r - 28.0 * s, b.y, 24.0 * s, 36.0 * s), pal().accent);
+            }
+            b.hit(PanelHit::Shell(cmd), row, true);
+            b.y += 38.0 * s;
+        }
+        b.divider();
+        for (cmd, label) in [
+            (16, if self.config.dock.immersive { "Immersive launches: On" } else { "Immersive launches: Off" }),
+            (15, "Open settings file"),
+            (17, "Quit WinShellTheme"),
+        ] {
+            let (l, r) = b.inner();
+            let row = rectf(l, b.y, r - l, 32.0 * s);
+            b.text(label, Font::Body, D2D_RECT_F { left: l + 8.0 * s, ..row }, pal().text_primary, Align::Leading);
+            b.hit(PanelHit::Shell(cmd), row, true);
+            b.y += 34.0 * s;
+        }
+        b.note("Restore a window: Ctrl + Shift + Alt + F");
     }
 
     fn build_sound(&self, b: &mut Builder) {
@@ -387,7 +443,7 @@ impl App {
         for m in self.media.iter().take(MAX_MEDIA_CARDS) {
             b.y += 8.0 * s;
             let (l, r) = b.inner();
-            let card = rectf(l, b.y, r - l, 72.0 * s);
+            let card = rectf(l, b.y, r - l, 92.0 * s);
             let bg = m.tint.map(|t| (darken(t, 0.38) << 8) | 0xE6).unwrap_or(pal().pill_bg);
             b.fill(card, 10.0 * s, bg);
             let art = rectf(card.left + 10.0 * s, card.top + 10.0 * s, 52.0 * s, 52.0 * s);
@@ -401,24 +457,24 @@ impl App {
             let btn = 24.0 * s;
             let buttons_w = 3.0 * btn + 2.0 * 4.0 * s;
             let tx = art.right + 10.0 * s;
-            let tw = (card.right - 10.0 * s - buttons_w - 8.0 * s - tx).max(0.0);
+            let tw = (card.right - 10.0 * s - tx).max(0.0);
             let title = if m.title.is_empty() { "Unknown title" } else { m.title.as_str() };
             b.text(
                 title,
                 Font::BodyBold,
-                rectf(tx, card.top + 14.0 * s, tw, 22.0 * s),
+                rectf(tx, card.top + 8.0 * s, tw, 22.0 * s),
                 pal().text_primary,
                 Align::Leading,
             );
             b.text(
                 &m.artist,
                 Font::Sub,
-                rectf(tx, card.top + 36.0 * s, tw, 20.0 * s),
+                rectf(tx, card.top + 30.0 * s, tw, 20.0 * s),
                 pal().text_secondary,
                 Align::Leading,
             );
-            let by = card.top + (72.0 * s - btn) / 2.0;
-            let mut bx = card.right - 10.0 * s - buttons_w;
+            let by = card.top + 56.0 * s;
+            let mut bx = tx + (tw - buttons_w) / 2.0;
             for (g, cmd, enabled) in [
                 (glyph::PREVIOUS, MediaCommand::Previous, m.can_previous),
                 (if m.playing { glyph::PAUSE } else { glyph::PLAY }, MediaCommand::PlayPause, m.can_play_pause),
@@ -431,7 +487,7 @@ impl App {
                 }
                 bx += btn + 4.0 * s;
             }
-            b.y += 72.0 * s;
+            b.y += 92.0 * s;
         }
     }
 
@@ -716,9 +772,29 @@ impl App {
         let Some(mut p) = self.panel.take() else { return };
         let built = self.build_panel(&p);
         p.width = built.w;
-        p.height = built.y.ceil();
+        p.content_height = built.y.ceil();
+        let max_h =
+            (self.monitor.monitor.bottom - self.top_bar.rect.bottom - px(FLYOUT_GAP * 2.0, self.scale())).max(1) as f32;
+        p.height = p.content_height.min(max_h);
+        p.scroll = p.scroll.clamp(0.0, (p.content_height - p.height).max(0.0));
+        let shift = |r: &mut D2D_RECT_F| {
+            r.top -= p.scroll;
+            r.bottom -= p.scroll;
+        };
         p.items = built.items;
+        for item in &mut p.items {
+            match item {
+                Item::Fill(r, ..)
+                | Item::Stroke(r, ..)
+                | Item::Text(_, _, r, ..)
+                | Item::Glyph(_, _, r, _)
+                | Item::Bitmap(_, r) => shift(r),
+            }
+        }
         p.hits = built.hits;
+        for (_, r, _) in &mut p.hits {
+            shift(r);
+        }
         if p.hover.is_some_and(|h| h >= p.hits.len()) {
             p.hover = None;
         }
@@ -727,14 +803,27 @@ impl App {
         let (w, h) = (p.width as i32, p.height as i32);
         let gap = px(FLYOUT_GAP, s);
         let (rect, from_y) = match &p.kind {
+            PanelKind::Appearance => {
+                (win::rect(self.top_bar.rect.left, self.top_bar.rect.bottom + gap, w, h), -FLYOUT_SLIDE * s)
+            }
             PanelKind::WindowList(id) => {
                 let gi = self.dock_model.groups().iter().position(|g| &g.id == id);
                 let slot = gi.and_then(|gi| self.dock_layout.slot(gi)).unwrap_or_default();
-                let cx = self.dock.rect.left + ((slot.left + slot.right) / 2.0) as i32;
-                let x = (cx - w / 2).clamp(self.span.0, (self.span.1 - w).max(self.span.0));
-                (win::rect(x, self.dock.rect.top - gap - h, w, h), FLYOUT_SLIDE * s)
+                let x = self.dock.rect.right + gap;
+                let screen = self.monitor.monitor;
+                let cy = self.dock.rect.top + ((slot.top + slot.bottom) / 2.0) as i32;
+                let y = (cy - h / 2).clamp(screen.top + gap, (screen.bottom - gap - h).max(screen.top + gap));
+                (win::rect(x, y, w, h), 0.0)
             }
-            _ => (win::rect(self.top_bar.rect.right - w, self.top_bar.rect.bottom + gap, w, h), -FLYOUT_SLIDE * s),
+            _ => (
+                win::rect(
+                    (self.top_bar.rect.right - w).max(self.monitor.monitor.left),
+                    self.top_bar.rect.bottom + gap,
+                    w,
+                    h,
+                ),
+                -FLYOUT_SLIDE * s,
+            ),
         };
         self.flyout.place(&self.gfx, rect);
         self.panel = Some(p);
@@ -784,26 +873,57 @@ impl App {
         let full = rectf(0.0, 0.0, self.flyout.width(), self.flyout.height());
         render::fill_round(dc, full, radius, pal().glass_bg)?;
         render::stroke_round(dc, full, radius, pal().border)?;
-        for item in &p.items {
-            match item {
-                Item::Fill(r, rad, c) => render::fill_round(dc, *r, *rad, *c)?,
-                Item::Stroke(r, rad, c) => render::stroke_round(dc, *r, *rad, *c)?,
-                Item::Text(t, f, r, c, a) => {
-                    let align = match a {
-                        Align::Leading => DWRITE_TEXT_ALIGNMENT_LEADING,
-                        Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
-                        Align::Trailing => DWRITE_TEXT_ALIGNMENT_TRAILING,
-                    };
-                    render::text_aligned(dc, t, self.font(*f), *r, *c, align)?;
-                }
-                Item::Glyph(g, f, r, c) => render::glyph(dc, *g, self.font(*f), *r, *c)?,
-                Item::Bitmap(b, r) => render::draw_bitmap(dc, b, *r)?,
-            }
+        unsafe {
+            dc.PushAxisAlignedClip(
+                &rectf(1.0, 1.0, full.right - 2.0, full.bottom - 2.0),
+                windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_ALIASED,
+            );
         }
-        if let Some((_, r, true)) = p.hover.and_then(|i| p.hits.get(i)) {
-            render::fill_round(dc, *r, 6.0 * s, pal().hover_overlay)?;
+        let result = (|| -> Result<()> {
+            for item in &p.items {
+                match item {
+                    Item::Fill(r, rad, c) => render::fill_round(dc, *r, *rad, *c)?,
+                    Item::Stroke(r, rad, c) => render::stroke_round(dc, *r, *rad, *c)?,
+                    Item::Text(t, f, r, c, a) => {
+                        let align = match a {
+                            Align::Leading => DWRITE_TEXT_ALIGNMENT_LEADING,
+                            Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+                            Align::Trailing => DWRITE_TEXT_ALIGNMENT_TRAILING,
+                        };
+                        render::text_aligned(dc, t, self.font(*f), *r, *c, align)?;
+                    }
+                    Item::Glyph(g, f, r, c) => render::glyph(dc, *g, self.font(*f), *r, *c)?,
+                    Item::Bitmap(b, r) => render::draw_bitmap(dc, b, *r)?,
+                }
+            }
+            if let Some((_, r, true)) = p.hover.and_then(|i| p.hits.get(i)) {
+                render::fill_round(dc, *r, 6.0 * s, pal().hover_overlay)?;
+            }
+            Ok(())
+        })();
+        unsafe {
+            dc.PopAxisAlignedClip();
+        }
+        result?;
+        if p.content_height > p.height {
+            let track = p.height - 12.0 * s;
+            let thumb = (track * p.height / p.content_height).max(18.0 * s);
+            let y = 6.0 * s + (track - thumb) * p.scroll / (p.content_height - p.height);
+            render::fill_round(dc, rectf(p.width - 4.0 * s, y, 2.0 * s, thumb), s, pal().text_disabled)?;
         }
         Ok(())
+    }
+
+    pub fn scroll_panel(&mut self, direction: f32) {
+        let step = 48.0 * self.scale();
+        if let Some(p) = self.panel.as_mut() {
+            if p.drag.is_some() {
+                return;
+            }
+            p.scroll = (p.scroll + direction * step).clamp(0.0, (p.content_height - p.height).max(0.0));
+            p.hover = None;
+            self.show_panel(false);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -885,22 +1005,22 @@ impl App {
 
     fn perform(&mut self, hit: PanelHit) {
         match hit {
+            PanelHit::Shell(cmd) => {
+                self.close_panel();
+                self.on_shell_menu(cmd);
+                if (10..=14).contains(&cmd) || cmd == 16 {
+                    self.open_panel(PanelKind::Appearance);
+                }
+            }
             PanelHit::Activate(hwnd, elevated) => {
                 self.close_panel();
                 let h = HWND(hwnd as _);
-                if !actions::activate(h) {
-                    let msg = if elevated {
-                        "This is an administrator window: switch to it with Alt+Tab"
-                    } else {
-                        "Windows didn't allow switching to that window"
-                    };
-                    self.show_message_tooltip(msg);
-                }
+                self.present_window(h, elevated);
             }
             PanelHit::NewWindow(id) => {
                 self.close_panel();
                 if let Some(g) = self.dock_model.groups().iter().find(|g| g.id == id).cloned()
-                    && !actions::launch(&g.exe_path, g.aumid.as_deref())
+                    && !self.launch_app(&g.exe_path, g.aumid.as_deref(), &g.id)
                 {
                     self.show_message_tooltip(&format!("Couldn't start {}", group_name(&g)));
                 }

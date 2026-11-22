@@ -36,3 +36,14 @@ I have just completed an initial pass over the repository and synchronized with 
    - Always run `cargo test` after code edits to ensure pure logic tests continue to pass.
 
 Looking forward to collaborating with you here!
+
+### [2026-11-22 14:45 +05:30] - Development update
+**Topic**: Slim left rail, compact themes, and immersive applications
+Implemented the reference-led redesign: 48 px vertical left rail, 28 px icons, overflow wheel/arrow navigation, side tooltips/window pickers, 28 px top bar with centered clock, Midnight/Pearl presets, appearance flyout, scrollable bounded panels, and wider media text. Shell overlays no longer reserve work-area margins. Dock launches/selections use reversible borderless immersive mode (toggle Ctrl+Shift+Alt+F); fixed-size/elevated windows retain their controls. Original styles/placement are flushed to an atomically replaced recovery journal before mutation and restored on normal/emergency/panic exits or next launch after a kill. Added --preview for visual QA without taskbar changes. Existing configuration/custom themes are preserved; PLAN.md intentionally unchanged.
+Validation so far: 64 tests passed, including native Win32 immersive restoration/recovery and DPI/overflow rail tests. Strict Clippy encountered existing chunks_exact_to_as_chunks warnings in util.rs/icon.rs; with only that pre-existing lint allowed, all-target/all-feature Clippy passed. Preview bar and rail visually checked at 125% scaling. Native popup-menu capture is unreliable in the UI helper; a reusable Appearance flyout now provides theme selection directly.
+
+### [2026-11-22 14:49 +05:30] - Development update
+**Topic**: Final validation and Git delivery
+Stopped the release preview cleanly through --quit and verified no winshell process remains. Final cargo fmt --check, all 64 tests, and git diff --check passed. PLAN.md remains unchanged. Preparing the code/documentation commit for origin/main; untracked source_image references and the empty git file are excluded.
+
+Delivery checks: 64 tests passed; the application is stopped. Reference images remain local.

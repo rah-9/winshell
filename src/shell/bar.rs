@@ -64,6 +64,7 @@ impl PillKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BarHit {
+    User,
     Active,
     Pill(PillKind),
 }
@@ -86,6 +87,9 @@ impl BarLayout {
 
     fn hit(&self, x: f32, y: f32) -> Option<BarHit> {
         let inside = |r: &D2D_RECT_F| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+        if inside(&self.user) {
+            return Some(BarHit::User);
+        }
         if inside(&self.active) {
             return Some(BarHit::Active);
         }
@@ -320,7 +324,6 @@ impl App {
         let order = [
             PillKind::QuickSettings,
             PillKind::Notifications,
-            PillKind::Clock,
             PillKind::Battery,
             PillKind::Volume,
             PillKind::Wifi,
@@ -345,7 +348,23 @@ impl App {
             pills.push((k, r));
         }
         pills.reverse();
-        let zone_left = pills.first().map(|(_, r)| r.left).unwrap_or(bw - inset);
+        let status_left = pills.first().map(|(_, r)| r.left).unwrap_or(bw - inset);
+        // Centre the clock where possible; constrain the app title before it.
+        let mut zone_left = status_left;
+        if self.pill_visible(PillKind::Clock) {
+            let cw = (self.gfx.measure(&self.clock_text, &self.fonts.pill) + 2.0 * pad).ceil();
+            let min_x = divider.right + gap + 80.0 * s;
+            let clock_x = (bw / 2.0 - cw / 2.0).max(min_x);
+            if clock_x + cw + gap < status_left {
+                pills.push((PillKind::Clock, rectf(clock_x, y, cw, pill_h)));
+                zone_left = clock_x;
+            } else {
+                // Narrow display: retain clock access at the right, shrink title first.
+                let clock_x = (status_left - gap - cw).max(inset);
+                pills.push((PillKind::Clock, rectf(clock_x, y, cw, pill_h)));
+                zone_left = clock_x;
+            }
+        }
 
         let active_x = divider.right + gap;
         let icon_sz = px(ACTIVE_ICON, s) as f32;
@@ -383,7 +402,7 @@ impl App {
         render::stroke_round(dc, full, radius, pal().border)?;
 
         // Left zone.
-        render::fill_round(dc, l.user, pill_r, pal().pill_bg)?;
+        render::fill_round(dc, l.user, pill_r, bg(BarHit::User))?;
         let user_text = D2D_RECT_F { left: l.user.left + pad, right: l.user.right - pad + 1.0, ..l.user };
         render::text(dc, &self.user_handle, &self.fonts.pill, user_text, pal().text_secondary)?;
         render::fill_round(dc, l.divider, 0.0, pal().border)?;
@@ -456,6 +475,29 @@ impl App {
 
     pub fn bar_click(&mut self, x: f32, y: f32, button: Button) -> Option<MenuRequest> {
         match (self.bar.hit(x, y)?, button) {
+            (BarHit::User, Button::Left) => {
+                self.toggle_panel(PanelKind::Appearance);
+                None
+            }
+            (BarHit::User, _) => Some(MenuRequest {
+                owner: self.top_bar.hwnd,
+                x: self.top_bar.rect.left + self.bar.user.left as i32,
+                y: self.top_bar.rect.bottom + 4,
+                above: false,
+                items: vec![
+                    (10, "Theme: Midnight".into()),
+                    (11, "Theme: Pearl".into()),
+                    (12, "Theme: Dark Glass".into()),
+                    (13, "Theme: Light Clean".into()),
+                    (14, "Follow Windows theme".into()),
+                    (0, String::new()),
+                    (15, "Open settings file".into()),
+                    (16, "Toggle immersive launches".into()),
+                    (0, String::new()),
+                    (17, "Quit WinShellTheme".into()),
+                ],
+                context: MenuContext::Shell,
+            }),
             (BarHit::Active, Button::Left) => {
                 self.toggle_active_window();
                 None
@@ -464,6 +506,7 @@ impl App {
                 let maximized =
                     unsafe { windows::Win32::UI::WindowsAndMessaging::IsZoomed(self.active.hwnd).as_bool() };
                 let items = vec![
+                    (6, "Toggle immersive full screen\tCtrl+Shift+Alt+F".to_string()),
                     (1, "Minimize".to_string()),
                     (2, if maximized { "Restore" } else { "Maximize" }.to_string()),
                     (3, "Snap left".to_string()),
@@ -527,18 +570,81 @@ impl App {
         let iconic = unsafe { IsIconic(hwnd).as_bool() };
         if fg == apps::root_owner(hwnd) && !iconic {
             actions::minimize(hwnd);
-        } else if !actions::activate(hwnd) {
-            self.show_message_tooltip("Can't switch to that window");
+        } else {
+            self.present_window(hwnd, false);
+        }
+    }
+
+    pub fn on_shell_menu(&mut self, cmd: u32) {
+        if cmd == 15 {
+            actions::shell_open(&self.config_path.to_string_lossy(), None);
+            return;
+        }
+        if cmd == 17 {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(self.top_bar.hwnd),
+                    super::WM_SHELL_QUIT,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+            return;
+        }
+        let result = (|| -> std::result::Result<(), String> {
+            let text = std::fs::read_to_string(&self.config_path).map_err(|e| e.to_string())?;
+            let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
+            if cmd == 16 {
+                doc["dock"]["immersive"] = toml_edit::value(!self.config.dock.immersive);
+            } else {
+                let theme = match cmd {
+                    10 => "midnight",
+                    11 => "pearl",
+                    12 => "dark_glass",
+                    13 => "light_clean",
+                    14 => "auto_system",
+                    _ => return Ok(()),
+                };
+                doc["general"]["theme"] = toml_edit::value(theme);
+                doc["general"]["follow_windows_theme"] = toml_edit::value(false);
+            }
+            let updated = doc.to_string();
+            let config = winshell::config::parse(&updated)?;
+            std::fs::write(&self.config_path, &updated).map_err(|e| e.to_string())?;
+            self.last_self_write = Some(updated);
+            self.apply_settings(config);
+            Ok(())
+        })();
+        if let Err(e) = result {
+            log!("settings menu: {e}");
+            self.show_message_tooltip("Couldn't save settings (see the log)");
         }
     }
 
     pub fn on_active_menu(&mut self, hwnd: HWND, cmd: u32) {
         match cmd {
             1 => actions::minimize(hwnd),
-            2 => actions::toggle_maximize(hwnd),
-            3 => actions::snap(hwnd, true),
-            4 => actions::snap(hwnd, false),
+            2 => {
+                super::immersive::restore(hwnd);
+                actions::toggle_maximize(hwnd);
+            }
+            3 => {
+                super::immersive::restore(hwnd);
+                actions::snap(hwnd, true);
+            }
+            4 => {
+                super::immersive::restore(hwnd);
+                actions::snap(hwnd, false);
+            }
             5 => actions::close(hwnd),
+            6 => {
+                if super::immersive::is_managed(hwnd) {
+                    super::immersive::restore(hwnd);
+                } else {
+                    super::immersive::enter(hwnd);
+                }
+                self.update_visibility();
+            }
             _ => {}
         }
     }

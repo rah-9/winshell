@@ -16,6 +16,7 @@ use winshell::apps;
 use winshell::foreground::{self, Kind};
 use winshell::{log, win};
 
+use super::theme::{BAR_HEIGHT, BAR_MARGIN};
 use super::{App, TIMER_AUTOHIDE_BAR, TIMER_AUTOHIDE_DOCK, WINDOW_CLASS};
 
 /// How long a revealed bar/dock stays after the mouse leaves it.
@@ -25,9 +26,9 @@ const UNUSED_REVEAL_MS: u32 = 1500;
 
 pub struct Edges {
     pub top: HWND,
-    pub bottom: HWND,
+    pub left: HWND,
     top_shown: bool,
-    bottom_shown: bool,
+    left_shown: bool,
 }
 
 impl Edges {
@@ -35,21 +36,21 @@ impl Edges {
         let ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
         let zero = win::rect(0, 0, 1, 1);
         let top = win::create_popup(WINDOW_CLASS, windows::core::w!("WinShellTheme TopEdge"), ex, zero)?;
-        let bottom = win::create_popup(WINDOW_CLASS, windows::core::w!("WinShellTheme BottomEdge"), ex, zero)?;
-        for h in [top, bottom] {
+        let left = win::create_popup(WINDOW_CLASS, windows::core::w!("WinShellTheme LeftEdge"), ex, zero)?;
+        for h in [top, left] {
             // Alpha 1 of 255: invisible, but still receives the mouse (alpha 0 would not).
             unsafe {
                 let _ = SetLayeredWindowAttributes(h, COLORREF(0), 1, LWA_ALPHA);
             }
             winshell::dwm::exclude_from_peek(h);
         }
-        Ok(Self { top, bottom, top_shown: false, bottom_shown: false })
+        Ok(Self { top, left, top_shown: false, left_shown: false })
     }
 
     pub fn is_edge(&self, h: HWND) -> Option<bool> {
         if h == self.top {
             Some(true)
-        } else if h == self.bottom {
+        } else if h == self.left {
             Some(false)
         } else {
             None
@@ -57,7 +58,7 @@ impl Edges {
     }
 
     fn set(&mut self, top: bool, show: bool) {
-        let (h, flag) = if top { (self.top, &mut self.top_shown) } else { (self.bottom, &mut self.bottom_shown) };
+        let (h, flag) = if top { (self.top, &mut self.top_shown) } else { (self.left, &mut self.left_shown) };
         if *flag != show {
             *flag = show;
             unsafe {
@@ -69,7 +70,7 @@ impl Edges {
     pub fn destroy(&self) {
         unsafe {
             let _ = DestroyWindow(self.top);
-            let _ = DestroyWindow(self.bottom);
+            let _ = DestroyWindow(self.left);
         }
     }
 }
@@ -107,19 +108,15 @@ impl App {
 
     /// Register / remove the AppBar reservations to match the config.
     pub fn sync_reservations(&mut self) {
-        let (want_top, want_bottom) = (!self.autohide_bar(), !self.autohide_dock());
-        for (want, bar) in [(want_top, &mut self.top_reserve), (want_bottom, &mut self.bottom_reserve)] {
-            if want && !bar.registered {
-                bar.register();
-            } else if !want && bar.registered {
-                bar.remove();
-            }
-        }
+        // Visibility is independent from desktop reservations. Even a permanently
+        // visible rail overlays the desktop instead of shrinking application windows.
+        self.top_reserve.remove();
+        self.bottom_reserve.remove();
         // Without a registered AppBar, ABN_FULLSCREENAPP(false) can never arrive.
         if !self.top_reserve.registered && !self.bottom_reserve.registered {
             self.fullscreen = false;
         }
-        let any = self.autohide_bar() || self.autohide_dock();
+        let any = true; // also track immersive geometry / external fullscreen transitions
         if self.tracker.track_moves != any {
             self.tracker.track_moves = any;
             let fg = self.active.hwnd;
@@ -136,7 +133,16 @@ impl App {
         // Leave the top-right corner free: a maximised window's close button lives there.
         let corner = win::px(160.0, self.scale());
         win::move_window(self.edges.top, win::rect(left, m.top, (right - left - corner).max(1), 1), true);
-        win::move_window(self.edges.bottom, win::rect(left, m.bottom - 1, right - left, 1), true);
+        win::move_window(
+            self.edges.left,
+            win::rect(
+                m.left,
+                m.top + win::px(BAR_HEIGHT + BAR_MARGIN * 2.0, self.scale()),
+                1,
+                (m.bottom - m.top - win::px(BAR_HEIGHT + BAR_MARGIN * 2.0, self.scale())).max(1),
+            ),
+            true,
+        );
     }
 
     /// (covers `r`, is full screen) for the current foreground app.
@@ -172,10 +178,13 @@ impl App {
         // Detected full screen (from the window itself) disables the edge strips; the
         // AppBar flag only hides, it never removes the way back (review: stuck hidden).
         let detected_fs = fs_a || fs_b;
-        let fullscreen = self.fullscreen || detected_fs;
+        let managed = super::immersive::is_managed(unsafe { GetForegroundWindow() });
+        let fullscreen = (self.fullscreen || detected_fs) && !managed;
 
-        let hide_bar = fullscreen || (self.autohide_bar() && bar_covered && !self.reveal_bar && !panel_open);
-        let hide_dock = fullscreen || (self.autohide_dock() && dock_covered && !self.reveal_dock && !panel_open);
+        let hide_bar = !self.opts.preview
+            && (fullscreen || (self.autohide_bar() && bar_covered && !self.reveal_bar && !panel_open));
+        let hide_dock = !self.opts.preview
+            && (fullscreen || (self.autohide_dock() && dock_covered && !self.reveal_dock && !panel_open));
 
         if hide_bar == self.top_bar.visible {
             if hide_bar { self.top_bar.hide() } else { self.top_bar.show(false) }
@@ -190,8 +199,8 @@ impl App {
         }
         // Edge strips only when something is auto-hidden, and never over a
         // full-screen app (games, video): there the edges do nothing.
-        self.edges.set(true, hide_bar && !detected_fs);
-        self.edges.set(false, hide_dock && !detected_fs);
+        self.edges.set(true, hide_bar && (!detected_fs || managed));
+        self.edges.set(false, hide_dock && (!detected_fs || managed));
     }
 
     /// The mouse touched a screen edge strip.

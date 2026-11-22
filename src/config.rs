@@ -58,13 +58,15 @@ pub struct Dock {
     /// Exe paths (absolute, or a bare name found on PATH) or AUMIDs.
     pub pinned_apps: Vec<String>,
     /// Hide when an app is maximised or overlaps the dock; push the mouse to the
-    /// bottom edge to bring it back. Apps then get the full screen.
+    /// left edge to bring it back. The rail never reserves desktop space.
     pub autohide: bool,
+    /// Open dock-selected applications in reversible borderless full screen.
+    pub immersive: bool,
 }
 
 impl Default for Dock {
     fn default() -> Self {
-        Self { magnification: false, pinned_apps: Vec::new(), autohide: true }
+        Self { magnification: false, pinned_apps: Vec::new(), autohide: true, immersive: true }
     }
 }
 
@@ -87,7 +89,7 @@ pub const DEFAULT_CONFIG: &str = r#"# WinShellTheme configuration
 
 [general]
 user_handle = ""                 # empty = "@" + your Windows user name
-theme = "dark_glass"             # "dark_glass", "light_clean", a file in themes\ (no .toml), or "auto_system"
+theme = "midnight"               # "midnight", "pearl", "dark_glass", "light_clean", or "auto_system"
 follow_windows_theme = false     # true = follow Windows light/dark mode
 
 [top_bar]
@@ -96,7 +98,8 @@ autohide = true                  # hide over maximised apps; mouse to the top ed
 
 [dock]
 magnification = false            # draw the hovered icon at 1.15x
-autohide = true                  # hide over maximised apps; mouse to the bottom edge shows it
+autohide = true                  # hide over apps; mouse to the left edge shows it
+immersive = true                 # borderless full screen; Ctrl+Shift+Alt+F restores the window
 # Exe paths, bare exe names on PATH, or AUMIDs (packaged apps).
 # Right-click a dock icon > Pin to Dock to add entries here.
 pinned_apps = [

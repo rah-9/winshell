@@ -67,7 +67,7 @@ F:\theme\
     │   ├── mod.rs           # Shell app coordinator, WndProc dispatch, popup management
     │   ├── autohide.rs      # Dynamic auto-hide engine and invisible edge triggers
     │   ├── bar.rs           # Top bar rendering and layout
-    │   ├── dock.rs          # Bottom dock rendering, slot grouping, hover magnification
+    │   ├── dock.rs          # Vertical left rail, app grouping, overflow navigation
     │   ├── panel.rs         # Flyout panels (Sound, Wi-Fi, Bluetooth, Battery, Calendar)
     │   ├── popup.rs         # Wrapper for borderless popup HWNDs + DComp surfaces
     │   └── theme.rs         # Layout constants and thread-local palette access
@@ -119,3 +119,11 @@ F:\theme\
 
 - **Cross-Agent Communication**:
   Whenever you make a significant change, fix a bug, or pause a multi-step task, post an entry in [`CHAT.md`](CHAT.md) so the next agent (or the user) has full visibility into what was done and what remains.
+
+## Current layout and immersive behavior
+
+- The dock is a 48 px vertical left rail. The bar and rail are overlays and never reserve work-area space.
+- Preserve thin geometry, overflow access, DPI scaling, and side-anchored tooltips / pickers.
+- Immersive changes apply only to selected or dock-launched eligible windows. Save the original style and placement before mutation; restore on toggle, exit, panic, or next launch after termination. Keep fixed-size dialogs and elevated targets unchanged.
+- Keep full-screen recovery in `src/shell/immersive.rs`. Never simulate a universal F11 command.
+- `PLAN.md` remains historical and unchanged by this redesign. README and source describe current behavior.

@@ -87,6 +87,49 @@ pub const LIGHT_CLEAN: Palette = Palette {
     dark: false,
 };
 
+/// New compact-shell presets. Legacy theme files remain available and editable.
+pub const MIDNIGHT_TOML: &str = r##"# Midnight: soft graphite glass with an ice-blue accent.
+[colors]
+glass_bg = "#10151DD9"
+pill_surface = "#FFFFFF06"
+hover_surface = "#FFFFFF18"
+border = "#D5E7FF1C"
+text_primary = "#F4F7FC"
+text_secondary = "#ADB9C9"
+text_disabled = "#657387"
+accent = "#98C8FF"
+success = "#8FE0BF"
+warning = "#EDC787"
+danger = "#F094A1"
+[geometry]
+window_corners = "dwm_round"
+pill_corner_radius = 11
+icon_slot_radius = 9
+[motion]
+duration_ms = 150
+"##;
+
+pub const PEARL_TOML: &str = r##"# Pearl: misted white glass with a muted blue accent.
+[colors]
+glass_bg = "#EDF2F8D9"
+pill_surface = "#FFFFFF18"
+hover_surface = "#FFFFFF88"
+border = "#FFFFFF90"
+text_primary = "#202D40"
+text_secondary = "#53657C"
+text_disabled = "#8B99AB"
+accent = "#376CBE"
+success = "#28856A"
+warning = "#A56A20"
+danger = "#B94D60"
+[geometry]
+window_corners = "dwm_round"
+pill_corner_radius = 11
+icon_slot_radius = 9
+[motion]
+duration_ms = 150
+"##;
+
 pub const DARK_GLASS_TOML: &str = r##"# Dark Glass: default WinShellTheme theme. Edit and save: changes apply live.
 [theme.info]
 name = "Dark Glass"
