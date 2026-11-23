@@ -70,28 +70,84 @@ Fast, hardware-accelerated flyout panels sliding smoothly into view with DirectC
 
 ---
 
-## Installation & Quick Start
+## Build, Run & Install
 
-### Quick Install (Pre-built)
-If you have a built executable:
+The executable is not committed to this repository. GitHub's **Download ZIP** downloads the source code, not a runnable Windows app. Build `winshell.exe` using the steps below.
+
+### Build from source
+
+Install stable Rust with the MSVC toolchain, Visual Studio Build Tools 2022 with C++ support, and the Windows 11 SDK. Then run these commands in PowerShell:
+
 ```powershell
-# Installs to %LOCALAPPDATA%\Programs\WinShellTheme and registers autostart
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+git clone https://github.com/rah-9/winshell.git
+cd winshell
+cargo build --release --locked
 ```
 
-To uninstall and restore the native taskbar:
+The app is built at `target\release\winshell.exe`. No administrator privileges are needed to run it.
+
+### Try the app
+
+From the repository folder, preview the interface and open appearance settings without hiding the native Windows taskbar:
+
+```powershell
+.\target\release\winshell.exe --preview --settings
+```
+
+Close the preview before starting normal replacement mode:
+
+```powershell
+Start-Process -FilePath .\target\release\winshell.exe -ArgumentList '--quit' -Wait -WindowStyle Hidden
+.\target\release\winshell.exe --replace-taskbar --settings
+```
+
+Replacement mode hides the native Windows taskbars and releases their screen margins while the app runs. Desktop auto-hide keeps folders clear; touch the **top edge** for the bar or the **left edge** for the dock. Press **Ctrl+Shift+Alt+Space** to open the desktop control panel.
+
+Click the user badge for themes and behavior switches, or click the dock gear for sound, networks, devices, calendar, and desktop shortcuts. Existing settings and pinned apps are preserved.
+
+### Exit and recover
+
+Press **Ctrl+Shift+Alt+Esc** to restore the desktop and exit, or run:
+
+```powershell
+.\target\release\winshell.exe --quit
+```
+
+After a forced termination, relaunching the app repairs saved desktop state. To repair without starting the shell:
+
+```powershell
+.\target\release\winshell.exe --restore-taskbar
+```
+
+This command also restores saved immersive-window placement. If restoration cannot complete, the recovery files are kept for another attempt.
+
+### Install for the current user
+
+After building, pass the executable's location to the installer:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Source .\target\release\winshell.exe
+```
+
+The installer copies the app to `%LOCALAPPDATA%\Programs\WinShellTheme`, enables autostart, and launches it. Add `-NoAutostart -NoStart` to install without enabling startup or launching the app.
+
+To uninstall and restore the native desktop:
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
 ```
 
-### Building From Source
-Clone the repository and build with release optimizations:
+Settings are retained unless `-RemoveSettings` is supplied. Uninstallation stops if desktop restoration is incomplete.
+
+### Optional diagnostic utility
+
+The spike is excluded from normal builds. Build it explicitly:
+
 ```powershell
-cargo build --release
+cargo build --release --locked --features spike
 ```
-The compiled binaries will be output to:
-- `target\release\winshell.exe` (main shell application)
-- `target\release\spike.exe` (diagnostic & benchmarking utility)
+
+Its executable is `target\release\spike.exe`.
 
 ---
 
@@ -218,7 +274,7 @@ Dual-licensed under either **MIT** or **Apache-2.0** at your option.
 
 ## Validation and limitations
 
-Run `cargo test` after code changes. The suite includes a native Win32 fixture that checks immersive monitor bounds, style/placement restoration, and recovery from the saved journal, plus rail geometry tests for 100%, 125%, 150%, and 200% scaling.
+Run `cargo test` after code changes. The latest validated shell update passes **67 tests**. The suite includes a native Win32 fixture that checks immersive monitor bounds, style/placement restoration, and recovery from the saved journal, plus rail geometry tests for 100%, 125%, 150%, and 200% scaling.
 
 Build the diagnostic spike separately with `cargo build --release --features spike`.
 
