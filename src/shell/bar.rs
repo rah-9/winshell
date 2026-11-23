@@ -215,7 +215,7 @@ impl App {
         let fg = unsafe { GetForegroundWindow() };
         // Another app came forward (the hook skips our own windows). Normally the flyout
         // already closed on WA_INACTIVE; this covers a flyout Windows refused to focus.
-        if self.panel.is_some() && !App::foreground_is_ours(fg) {
+        if !self.opts.preview && self.panel.is_some() && !App::foreground_is_ours(fg) {
             self.close_panel();
         }
         if self.update_active(fg) {
@@ -596,6 +596,17 @@ impl App {
             let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
             if cmd == 16 {
                 doc["dock"]["immersive"] = toml_edit::value(!self.config.dock.immersive);
+            } else if cmd == 18 {
+                doc["taskbar"]["hide_native"] = toml_edit::value(!self.config.taskbar.hide_native);
+            } else if (20..=24).contains(&cmd) {
+                let (section, key, value) = match cmd {
+                    20 => ("top_bar", "compact", !self.config.top_bar.compact),
+                    21 => ("general", "desktop_autohide", !self.config.general.desktop_autohide),
+                    22 => ("top_bar", "autohide", !self.config.top_bar.autohide),
+                    23 => ("dock", "autohide", !self.config.dock.autohide),
+                    _ => ("dock", "magnification", !self.config.dock.magnification),
+                };
+                doc[section][key] = toml_edit::value(value);
             } else {
                 let theme = match cmd {
                     10 => "midnight",

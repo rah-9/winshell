@@ -22,7 +22,7 @@ This document contains operational instructions, architecture invariants, and co
 
 3. **Taskbar State Restoration Invariant**:
    - The native taskbar's original state must **always** be protected.
-   - Any code that modifies `ABS_AUTOHIDE` must do so through [`src/taskbar.rs`](src/taskbar.rs) (`TaskbarGuard`) ensuring [`taskbar_state.toml`](src/taskbar_state.rs) is written *before* the modification and deleted only after a successful restore.
+   - Native taskbar visibility, work-area changes, and `ABS_AUTOHIDE` must be managed through [`src/taskbar.rs`](src/taskbar.rs) (`TaskbarGuard`) ensuring [`taskbar_state.toml`](src/taskbar_state.rs) is written *before* the modification and deleted only after a successful restore.
 
 4. **Zero-Polling / Event-Driven Architecture**:
    - Never add periodic polling loops or busy-wait timers for system state.
@@ -127,3 +127,9 @@ F:\theme\
 - Immersive changes apply only to selected or dock-launched eligible windows. Save the original style and placement before mutation; restore on toggle, exit, panic, or next launch after termination. Keep fixed-size dialogs and elevated targets unchanged.
 - Keep full-screen recovery in `src/shell/immersive.rs`. Never simulate a universal F11 command.
 - `PLAN.md` remains historical and unchanged by this redesign. README and source describe current behavior.
+
+## Native-taskbar replacement and desktop clearance
+
+The user authorized native-taskbar suppression and reversible work-area changes. Keep them inside TaskbarGuard; protect the original native bitmask, per-window visibility, and monitor geometry with the atomic recovery journal before mutation. Restore on exit, emergency exit, panic, and next launch after termination. Preserve recovery files on failed restoration. Never overwrite another desktop tool's subsequent work-area changes. Suppression reapplication is event-driven.
+
+The bar defaults to a compact centered width. Desktop auto-hide keeps icons unobstructed. Settings must be reachable with Ctrl+Shift+Alt+Space or --settings. Terminal and command-prompt customization are deferred until the shell stage is complete.

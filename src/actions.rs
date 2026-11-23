@@ -220,3 +220,8 @@ fn expand_env(s: &str) -> String {
     out.push_str(rest);
     out
 }
+
+/// Native desktop toggle, without moving or changing desktop icons.
+pub fn show_desktop() {
+    send_keys(&[VK_LWIN, VK_D]);
+}

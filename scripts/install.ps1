@@ -35,7 +35,7 @@ New-Item -ItemType Directory -Force -Path $dest | Out-Null
 
 if (Test-Path -LiteralPath $exe -PathType Leaf) {
     Write-Host 'Stopping the running copy (it restores the taskbar)...'
-    [void](Invoke-Winshell $exe '--quit')
+    if ((Invoke-Winshell $exe '--quit') -ne 0) { throw 'The running shell could not exit safely; installation cancelled.' }
 }
 
 Copy-Item -LiteralPath $Source -Destination $exe -Force

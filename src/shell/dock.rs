@@ -31,6 +31,7 @@ pub enum MediaPart {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockHit {
     Start,
+    Controls,
     Scroll(i32),
     /// Index into `DockModel::groups()`.
     App(usize),
@@ -51,6 +52,7 @@ pub struct DockLayout {
     pub height: f32,
     pub navigation: Vec<(i32, D2D_RECT_F)>,
     pub start: D2D_RECT_F,
+    pub controls: D2D_RECT_F,
     pub apps: Vec<(usize, D2D_RECT_F)>,
     pub separators: Vec<f32>,
     pub media: Option<MediaLayout>,
@@ -70,6 +72,9 @@ impl DockLayout {
         }
         if let Some((step, _)) = self.navigation.iter().find(|(_, r)| inside(r, x, y)) {
             return Some(DockHit::Scroll(*step));
+        }
+        if inside(&self.controls, x, y) {
+            return Some(DockHit::Controls);
         }
         let m = self.media.as_ref()?;
         if inside(&m.play, x, y) {
@@ -154,6 +159,11 @@ fn build_rail(s: f32, pinned: usize, count: usize, offset: usize, max_apps: usiz
         l.media = Some(MediaLayout { pill, art, play });
         y = pill.bottom;
     }
+    y += DOCK_SEPARATOR_MARGIN * s;
+    l.separators.push(y.round());
+    y += DOCK_SEPARATOR_MARGIN * s;
+    l.controls = rectf(x, y, slot, slot);
+    y += slot;
     l.height = (y + DOCK_PAD * s).ceil();
     l
 }
@@ -213,6 +223,7 @@ impl App {
                 changed |= self.dock_model.remove(p.hwnd);
                 continue;
             }
+            self.taskbar.observe_window(HWND(p.hwnd as _));
             match apps::window_entry(HWND(p.hwnd as _)) {
                 Some(e) => changed |= self.dock_model.upsert(e),
                 None => changed |= self.dock_model.remove(p.hwnd),
@@ -411,6 +422,10 @@ impl App {
             hover_bg(l.start)?;
         }
         paint_start_glyph(dc, l.start, s)?;
+        if self.dock_hover == Some(DockHit::Controls) {
+            hover_bg(l.controls)?;
+        }
+        render::glyph(dc, glyph::SETTINGS, &self.fonts.icon, l.controls, pal().text_secondary)?;
 
         for y in &l.separators {
             render::fill_round(dc, rectf(10.0 * s, *y, dw - 20.0 * s, 1.0), 0.0, pal().border)?;
@@ -568,6 +583,7 @@ impl App {
         match hit {
             Some(DockHit::Start) => self.show_tooltip_at("Start", self.dock_layout.start),
             Some(DockHit::Scroll(_)) => self.hide_tooltip(),
+            Some(DockHit::Controls) => self.show_tooltip_at("Your desktop", self.dock_layout.controls),
             Some(DockHit::App(gi)) => {
                 if let (Some(g), Some(slot)) = (self.dock_model.groups().get(gi), self.dock_layout.slot(gi)) {
                     let mut name = group_name(g);
@@ -591,6 +607,10 @@ impl App {
         let hit = self.dock_layout.hit(x, y)?;
         self.hide_tooltip();
         match (hit, button) {
+            (DockHit::Controls, Button::Left) => {
+                self.toggle_panel(PanelKind::Controls);
+                None
+            }
             (DockHit::Scroll(step), Button::Left) => {
                 self.scroll_dock(step);
                 None

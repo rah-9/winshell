@@ -253,6 +253,8 @@ impl WindowSurface {
             let mut offset = POINT::default();
             let dc: ID2D1DeviceContext = surface.BeginDraw(dirty.map(|_| &r as *const RECT), &mut offset)?;
             dc.SetDpi(96.0, 96.0);
+            // Grayscale text avoids color fringes on translucent composition surfaces.
+            dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             dc.SetTransform(&Matrix3x2::translation((offset.x - r.left) as f32, (offset.y - r.top) as f32));
             let clip =
                 D2D_RECT_F { left: r.left as f32, top: r.top as f32, right: r.right as f32, bottom: r.bottom as f32 };

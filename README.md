@@ -4,13 +4,14 @@ A high-performance, lightweight, and fully customizable desktop shell overlay fo
 
 WinShellTheme delivers a compact translucent top bar, a thin vertical left dock, and interactive flyout panels rendered with **Direct2D**, **DirectWrite**, and **DirectComposition** over native **Desktop Window Manager (DWM)** backdrops (Acrylic & Mica).
 
-`explorer.exe` continues running in the background; WinShellTheme requires **no administrator privileges**, uses no kernel hooks or DLL injection, and safely manages the native Windows taskbar with crash-proof state restoration.
+`explorer.exe` continues running in the background; WinShellTheme requires **no administrator privileges**, uses no kernel hooks or DLL injection, and hides the native Windows taskbars while running, with saved visibility, work areas, and recovery on the next launch after a forced exit.
 
 ---
 
 ## Highlights & Features
 
-### 🖥️ Translucent Top Bar
+### 🖥️ Compact Floating Top Bar
+- **Unobstructed desktop**: The bar is capped at 920 logical pixels and floats at the top center. Desktop auto-hide keeps folders and icons clear; touching the top or left edge reveals the shell.
 - **Active Window Status**: Displays the current application icon and title (intelligently truncated), following focus and title changes live via targeted WinEvent hooks. Click to minimize/restore; right-click to access quick window-management actions (Minimize, Maximize, Snap Left, Snap Right, Close).
 - **Custom User Badge**: Shows your user handle (or `@` + Windows username) with a translucent capsule background.
 - **Localized Minute Clock**: Precise minute turnover synchronized via a one-shot timer with zero drift and zero wakeups between minutes.
@@ -34,7 +35,7 @@ Fast, hardware-accelerated flyout panels sliding smoothly into view with DirectC
 - **Calendar Flyout**: Current localized date header, Gregorian 6x7 month grid navigation, previous/next month browsing, and one-click return to today.
 
 ### 👻 Smart Auto-Hide Engine
-- **Full Display Utilization**: The bar and rail never reserve screen space, even with auto-hide disabled. Immersive windows fill their monitor without shell margins; ordinary maximized windows still follow the Windows work area.
+- **Full Display Utilization**: The bar and rail never reserve screen space, even with auto-hide disabled. Immersive windows fill their monitor without shell margins; replacement mode also releases the native taskbar margin so ordinary maximized windows can use the full work area.
 - **Context-Aware Visibility**: Automatically hides the overlay when an application window is maximized, true full-screen, or overlaps the bar or dock. Windows maximized on secondary monitors will not hide the primary monitor's overlay.
 - **Invisible Edge Reveal Triggers**: Move the mouse cursor to the top or left edge of the screen to reveal the bar or dock.
 - **Caption-Button Safe Zone**: The top edge reveal strip leaves the top-right 160 px free, allowing you to click maximized window Close, Maximize, and Minimize buttons without accidentally triggering the top bar.
@@ -46,7 +47,7 @@ Fast, hardware-accelerated flyout panels sliding smoothly into view with DirectC
 - **Hard-Budgeted Texture Cache**: Custom LRU icon texture cache strictly bounded to an 8 MB ceiling.
 
 ### 🔒 Safety, Reversibility & Process Hardening
-- **Crash-Proof Taskbar Restoration**: When hiding the native Windows taskbar, its exact state (`ABM_GETSTATE`) is written to `%APPDATA%\WinShellTheme\taskbar_state.toml` *before* any change is made. The native taskbar is restored automatically on clean exit, panic/crash hook, emergency hotkey, or upon next startup if terminated unexpectedly.
+- **Native taskbar replacement**: Primary and secondary Windows taskbar windows are hidden through normal window APIs. Explorer and desktop icons remain running. The taskbar state, visibility, and monitor work areas are flushed and atomically saved before changes. Exit and emergency exit restore them; a forced kill is repaired on the next launch. Failed restoration retains the recovery file. Explorer restart and taskbar show events reapply suppression without polling.
 - **Emergency Panic Hotkey**: Press **`Ctrl + Shift + Alt + Esc`** (or `Ctrl + Shift + Alt + F12` fallback) at any time to immediately restore native desktop boundaries and exit.
 - **User-Mode Execution**: Operates strictly as `asInvoker`. No administrative privileges required.
 - **Process Hardening**: Restricts DLL search directories exclusively to `System32`, strips the current directory from the search path, rejects UNC/low-integrity DLLs, and disables legacy application extension points.
@@ -54,7 +55,7 @@ Fast, hardware-accelerated flyout panels sliding smoothly into view with DirectC
 ### 🎨 Live Theming & Hot Reload
 - Supports custom themes via TOML files in `%APPDATA%\WinShellTheme\themes\`.
 - New installs default to **Midnight**, a soft graphite glass theme. **Pearl**, **Dark Glass**, and **Light Clean** are also included.
-- Click the top-left user badge to open **Make it yours** and change themes or toggle immersive launches. Existing settings and custom theme files are preserved.
+- Click the user badge to open **Make it yours**: themes, compact layout, desktop clearance, bar/dock auto-hide, magnification, immersive launches, and Windows taskbar visibility. The dock gear opens **Your desktop** for sound, networks, devices, battery, calendar, Show Desktop, and Windows settings. Existing settings and custom theme files are preserved.
 - Can follow system dark/light mode automatically (`theme = "auto_system"`).
 - Background file watcher (`ReadDirectoryChangesW`) reloads configuration and theme adjustments instantly without restarting the application.
 
@@ -101,6 +102,9 @@ winshell.exe [OPTIONS]
 
 Options:
   --preview            Show targetable preview surfaces without changing the native taskbar
+  --settings           Open appearance settings (also works on a running shell)
+  --replace-taskbar    Hide native taskbars for this launch, overriding saved preferences
+  --diagnose           Report taskbar visibility and monitor work areas
   --quit               Politely ask the running shell to exit and restore the taskbar
   --restore-taskbar    Restore the native Windows taskbar from a leftover state file
   --enable-autostart   Register winshell in HKCU Run to start with Windows
@@ -123,6 +127,7 @@ Options:
 | **`Ctrl + Shift + Alt + Esc`** | **Emergency Exit**: restores native taskbar, frees screen reservations, and exits cleanly (falls back to `F12` if Esc is occupied). |
 | **`Win`** (tap Start button) | Toggles the native Windows Start Menu. |
 | **`Ctrl + Shift + Alt + F`** | Toggle reversible immersive full screen for the active window. |
+| **`Ctrl + Shift + Alt + Space`** | Open the desktop control panel. |
 | **Mouse wheel on dock** | Scroll application overflow. |
 | **User badge** | Open appearance settings; right-click for the compact menu. |
 | **`Esc`** | Closes any open flyout panel. |
@@ -138,8 +143,10 @@ On first run, configuration is generated at `%APPDATA%\WinShellTheme\config.toml
 user_handle = ""                 # Leave empty for "@" + Windows username
 theme = "midnight"               # "midnight", "pearl", "dark_glass", "light_clean", or "auto_system"
 follow_windows_theme = false     # Automatically switch theme with Windows light/dark mode
+desktop_autohide = true          # Keep desktop icons clear until an edge is touched
 
 [top_bar]
+compact = true                  # Floating bar capped at 920 logical pixels
 enabled_pills = [
     "bluetooth",
     "wifi",
@@ -161,6 +168,7 @@ pinned_apps = [                  # Executable names, full paths, or AUMIDs
 ]
 
 [taskbar]
+hide_native = true              # Show only WinShellTheme; restore Windows on exit
 autohide_native = true           # Autohides native Windows taskbar while winshell runs
 ```
 
@@ -214,6 +222,8 @@ Run `cargo test` after code changes. The suite includes a native Win32 fixture t
 
 Build the diagnostic spike separately with `cargo build --release --features spike`.
 
-Immersive mode uses documented borderless-window APIs, not an application's F11 command. Apps that draw their own title bars may retain those controls. A forced process kill is repaired on the next shell launch. No watchdog process runs. Native taskbar restoration retains its existing implementation; its backup is a direct file write, not an atomic transaction.
+Immersive mode uses documented borderless-window APIs, not an application's F11 command. Apps that draw their own title bars may retain those controls. A forced process kill is repaired on the next shell launch. No watchdog process runs. Taskbar recovery now includes visibility and per-monitor work areas. Work-area restoration applies only on matching displays when the current geometry is still the value applied by this shell, preserving later changes by other tools.
 
 `PLAN.md` is the historical design document and intentionally remains unchanged. Current behavior and settings are described here and in the source.
+
+Replacement mode uses documented window and work-area APIs; see [Microsoft work-area documentation](https://learn.microsoft.com/en-us/windows/win32/gdi/multiple-monitor-system-metrics). It does not replace Explorer, install a service, or modify Terminal settings. Terminal customization is a separate stage.

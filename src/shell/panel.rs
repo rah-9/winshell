@@ -32,6 +32,7 @@ const MAX_MEDIA_CARDS: usize = 3;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PanelKind {
     Appearance,
+    Controls,
     Sound,
     Battery,
     Calendar,
@@ -50,6 +51,8 @@ pub enum SliderKind {
 #[derive(Clone, Debug, PartialEq)]
 enum PanelHit {
     Shell(u32),
+    Panel(PanelKind),
+    Desktop,
     Activate(isize, bool),
     NewWindow(String),
     ToggleMute,
@@ -145,6 +148,30 @@ impl Builder {
         self.text(t, Font::Header, rectf(l, self.y, r - l, 24.0 * s), pal().text_primary, Align::Leading);
         self.y += 24.0 * s + 8.0 * s;
     }
+    fn toggle(&mut self, label: &str, on: bool, action: PanelHit) {
+        let (l, r) = self.inner();
+        let s = self.s;
+        let row = rectf(l, self.y, r - l, 38.0 * s);
+        self.text(
+            label,
+            Font::Body,
+            rectf(l + 6.0 * s, self.y, r - l - 58.0 * s, 38.0 * s),
+            pal().text_primary,
+            Align::Leading,
+        );
+        let track = rectf(r - 42.0 * s, self.y + 9.0 * s, 36.0 * s, 20.0 * s);
+        self.fill(track, 10.0 * s, if on { pal().accent } else { pal().slider_track });
+        let knob = rectf(
+            if on { track.right - 17.0 * s } else { track.left + 3.0 * s },
+            track.top + 3.0 * s,
+            14.0 * s,
+            14.0 * s,
+        );
+        self.fill(knob, 7.0 * s, if on { pal().on_accent } else { pal().text_primary });
+        self.hit(action, row, true);
+        self.y += 40.0 * s;
+    }
+
     /// Header with an on/off switch at the right (like the native quick settings tiles).
     fn header_toggle(&mut self, t: &str, state: Option<bool>, sel: RadioSel) {
         let (l, r) = self.inner();
@@ -257,6 +284,7 @@ impl App {
         }
         let name = match &kind {
             PanelKind::Appearance => "appearance",
+            PanelKind::Controls => "controls",
             PanelKind::Sound => "sound",
             PanelKind::Battery => "battery",
             PanelKind::Calendar => "calendar",
@@ -329,6 +357,7 @@ impl App {
         let mut b = Builder { s, w: w.round(), y: FLYOUT_PAD * s, items: Vec::new(), hits: Vec::new() };
         match &p.kind {
             PanelKind::Appearance => self.build_appearance(&mut b),
+            PanelKind::Controls => self.build_controls(&mut b),
             PanelKind::Sound => self.build_sound(&mut b),
             PanelKind::Battery => self.build_battery(&mut b),
             PanelKind::Calendar => self.build_calendar(&mut b, p.cal),
@@ -374,11 +403,20 @@ impl App {
             b.y += 38.0 * s;
         }
         b.divider();
-        for (cmd, label) in [
-            (16, if self.config.dock.immersive { "Immersive launches: On" } else { "Immersive launches: Off" }),
-            (15, "Open settings file"),
-            (17, "Quit WinShellTheme"),
+        b.header("Desktop & windows");
+        for (cmd, label, on) in [
+            (20, "Compact floating bar", self.config.top_bar.compact),
+            (21, "Keep desktop icons clear", self.config.general.desktop_autohide),
+            (22, "Auto-hide top bar over apps", self.config.top_bar.autohide),
+            (23, "Auto-hide left dock over apps", self.config.dock.autohide),
+            (24, "Magnify hovered icons", self.config.dock.magnification),
+            (16, "Immersive app launches", self.config.dock.immersive),
+            (18, "Hide Windows taskbars", self.config.taskbar.hide_native),
         ] {
+            b.toggle(label, on, PanelHit::Shell(cmd));
+        }
+        b.divider();
+        for (cmd, label) in [(15, "Open settings file"), (17, "Quit and restore Windows")] {
             let (l, r) = b.inner();
             let row = rectf(l, b.y, r - l, 32.0 * s);
             b.text(label, Font::Body, D2D_RECT_F { left: l + 8.0 * s, ..row }, pal().text_primary, Align::Leading);
@@ -386,6 +424,42 @@ impl App {
             b.y += 34.0 * s;
         }
         b.note("Restore a window: Ctrl + Shift + Alt + F");
+    }
+
+    fn build_controls(&self, b: &mut Builder) {
+        let s = b.s;
+        b.header("Your desktop");
+        b.note(&format!("{} running apps", self.dock_model.groups().iter().filter(|g| g.is_running()).count()));
+        for (label, glyph, kind) in [
+            ("Appearance & behavior", glyph::SETTINGS, PanelKind::Appearance),
+            ("Sound & media", glyph::VOLUME_2, PanelKind::Sound),
+            ("Wi-Fi networks", glyph::WIFI, PanelKind::Wifi),
+            ("Bluetooth devices", glyph::BLUETOOTH, PanelKind::Bluetooth),
+            ("Power & battery", glyph::BATTERY_FULL, PanelKind::Battery),
+            ("Calendar", glyph::BELL, PanelKind::Calendar),
+        ] {
+            let (l, r) = b.inner();
+            let row = rectf(l, b.y, r - l, 38.0 * s);
+            b.glyph(glyph, rectf(l + 4.0 * s, b.y, 28.0 * s, 38.0 * s), pal().accent);
+            b.text(
+                label,
+                Font::Body,
+                rectf(l + 40.0 * s, b.y, r - l - 44.0 * s, 38.0 * s),
+                pal().text_primary,
+                Align::Leading,
+            );
+            b.hit(PanelHit::Panel(kind), row, true);
+            b.y += 40.0 * s;
+        }
+        b.divider();
+        let (l, r) = b.inner();
+        let row = rectf(l, b.y, r - l, 34.0 * s);
+        b.text("Show desktop", Font::Body, row, pal().accent, Align::Leading);
+        b.hit(PanelHit::Desktop, row, true);
+        b.y += 36.0 * s;
+        b.link("Wallpaper & personalization", "ms-settings:personalization-background");
+        b.link("Display settings", "ms-settings:display");
+        b.link("Windows settings", "ms-settings:");
     }
 
     fn build_sound(&self, b: &mut Builder) {
@@ -1005,11 +1079,21 @@ impl App {
 
     fn perform(&mut self, hit: PanelHit) {
         match hit {
+            PanelHit::Panel(kind) => self.open_panel(kind),
+            PanelHit::Desktop => {
+                self.close_panel();
+                actions::show_desktop();
+            }
             PanelHit::Shell(cmd) => {
+                let scroll = self.panel.as_ref().map(|p| p.scroll).unwrap_or(0.0);
                 self.close_panel();
                 self.on_shell_menu(cmd);
-                if (10..=14).contains(&cmd) || cmd == 16 {
+                if (10..=14).contains(&cmd) || cmd == 16 || cmd == 18 || (20..=24).contains(&cmd) {
                     self.open_panel(PanelKind::Appearance);
+                    if let Some(p) = self.panel.as_mut() {
+                        p.scroll = scroll;
+                    }
+                    self.show_panel(false);
                 }
             }
             PanelHit::Activate(hwnd, elevated) => {

@@ -192,7 +192,7 @@ pub fn taskbar_info() -> Option<TaskbarInfo> {
         if SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) == 0 {
             return None;
         }
-        let state = SHAppBarMessage(ABM_GETSTATE, &mut data(HWND::default())) as u32;
+        let state = taskbar_state();
         let edge = match abd.uEdge {
             ABE_LEFT => "left",
             ABE_TOP => "top",
@@ -218,7 +218,7 @@ pub fn describe_notification(wparam: usize, lparam: LPARAM) -> String {
 
 /// Raw `ABM_GETSTATE` value of the native taskbar (`ABS_AUTOHIDE` | `ABS_ALWAYSONTOP`).
 pub fn taskbar_state() -> u32 {
-    let mut abd = data(HWND::default());
+    let mut abd = data(unsafe { FindWindowW(windows::core::w!("Shell_TrayWnd"), None) }.unwrap_or_default());
     unsafe { SHAppBarMessage(ABM_GETSTATE, &mut abd) as u32 }
 }
 

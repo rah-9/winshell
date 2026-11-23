@@ -97,6 +97,18 @@ fn frame(hwnd: HWND) -> Option<RECT> {
     Some(r)
 }
 
+fn hidden(
+    preview: bool,
+    fullscreen: bool,
+    desktop_clear: bool,
+    covered: bool,
+    auto: bool,
+    revealed: bool,
+    panel: bool,
+) -> bool {
+    !preview && (fullscreen || ((desktop_clear || (auto && covered)) && !revealed && !panel))
+}
+
 impl App {
     pub fn autohide_bar(&self) -> bool {
         self.config.top_bar.autohide
@@ -180,11 +192,29 @@ impl App {
         let detected_fs = fs_a || fs_b;
         let managed = super::immersive::is_managed(unsafe { GetForegroundWindow() });
         let fullscreen = (self.fullscreen || detected_fs) && !managed;
+        let fg = unsafe { GetForegroundWindow() };
+        let desktop = foreground::classify(fg) == Kind::Desktop
+            || (self.active.kind == Kind::Desktop && (fg.0.is_null() || App::foreground_is_ours(fg)));
+        let clear_desktop = self.config.general.desktop_autohide && desktop;
 
-        let hide_bar = !self.opts.preview
-            && (fullscreen || (self.autohide_bar() && bar_covered && !self.reveal_bar && !panel_open));
-        let hide_dock = !self.opts.preview
-            && (fullscreen || (self.autohide_dock() && dock_covered && !self.reveal_dock && !panel_open));
+        let hide_bar = hidden(
+            self.opts.preview,
+            fullscreen,
+            clear_desktop,
+            bar_covered,
+            self.autohide_bar(),
+            self.reveal_bar,
+            panel_open,
+        );
+        let hide_dock = hidden(
+            self.opts.preview,
+            fullscreen,
+            clear_desktop,
+            dock_covered,
+            self.autohide_dock(),
+            self.reveal_dock,
+            panel_open,
+        );
 
         if hide_bar == self.top_bar.visible {
             if hide_bar { self.top_bar.hide() } else { self.top_bar.show(false) }
@@ -261,5 +291,20 @@ impl App {
             self.top_reserve.registered,
             self.bottom_reserve.registered
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hidden;
+    #[test]
+    fn desktop_stays_clear_but_edge_and_panel_reveal_work() {
+        assert!(hidden(false, false, true, false, false, false, false));
+        assert!(!hidden(false, false, true, false, true, true, false));
+        assert!(!hidden(false, false, true, false, true, false, true));
+        assert!(!hidden(false, false, false, false, true, false, false));
+        assert!(hidden(false, false, false, true, true, false, false));
+        assert!(hidden(false, true, false, true, true, true, true));
+        assert!(!hidden(true, true, true, true, true, false, false));
     }
 }

@@ -31,7 +31,9 @@ use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_F};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_F, VK_SPACE,
+};
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, Result, w};
@@ -68,6 +70,7 @@ const TOPBAR_CLASS: PCWSTR = w!("WinShellTheme_TopBarClass");
 const WINDOW_CLASS: PCWSTR = w!("WinShellTheme_Window");
 const FLYOUT_CLASS: PCWSTR = w!("WinShellTheme_FlyoutClass");
 
+const HOTKEY_CONTROLS: i32 = 0x5747;
 const HOTKEY_IMMERSIVE: i32 = 0x5746;
 const TIMER_CLOCK: usize = 1;
 const TIMER_TOOLTIP_HIDE: usize = 2;
@@ -78,6 +81,7 @@ const TIMER_AUTOHIDE_DOCK: usize = 4;
 const WM_SHELL_RESTORE: u32 = WM_APP + 0x28;
 /// `winshell.exe --quit`: ask the running instance to exit cleanly (restoring the taskbar).
 /// UIPI stops lower-integrity processes from posting WM_APP messages to this window.
+const WM_SHELL_SETTINGS: u32 = WM_APP + 0x2C;
 const WM_SHELL_QUIT: u32 = WM_APP + 0x29;
 /// A decoded WM_SETTINGCHANGE (wParam = SETTING_*), posted to ourselves so the
 /// original lParam pointer is never stored or re-posted (security review F1).
@@ -93,9 +97,10 @@ const USAGE: &str = "WinShellTheme (winshell.exe)
   winshell.exe --restore-taskbar    put the native taskbar back from a leftover state file
   winshell.exe --enable-autostart   start with Windows (HKCU Run value)
   winshell.exe --disable-autostart  stop starting with Windows
+  winshell.exe --diagnose           report native taskbar state without changing it
   winshell.exe --help
 
-Start options: --preview, --no-taskbar, --reserve layered|hidden|plan,
+Start options: --settings, --preview, --replace-taskbar, --no-taskbar, --reserve layered|hidden|plan,
                --backdrop acrylic|mica|tabbed|none, --corners round|small|none";
 
 const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
@@ -115,6 +120,8 @@ thread_local! {
 pub struct Options {
     /// Visible, targetable surfaces for development / visual QA. Never touches the taskbar.
     preview: bool,
+    settings: bool,
+    replace_taskbar: bool,
     reserve: ReserveMode,
     style: DwmStyle,
     /// `--no-taskbar`: never touch the native taskbar this run.
@@ -127,6 +134,8 @@ impl Options {
     fn from_args() -> std::result::Result<Self, String> {
         let mut o = Options {
             preview: false,
+            settings: false,
+            replace_taskbar: false,
             reserve: ReserveMode::Layered,
             style: DwmStyle::default(),
             keep_taskbar: false,
@@ -147,6 +156,8 @@ impl Options {
                     o.preview = true;
                     o.keep_taskbar = true;
                 }
+                "--settings" => o.settings = true,
+                "--replace-taskbar" => o.replace_taskbar = true,
                 "--autostart" => {}
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -311,7 +322,11 @@ pub fn main() {
     immersive::repair();
 
     let config_path = dir.join("config.toml");
-    let (config, err) = config::load_or_create(&config_path);
+    let (mut config, err) = config::load_or_create(&config_path);
+    if opts.replace_taskbar {
+        config.taskbar.hide_native = true;
+        config.taskbar.autohide_native = true;
+    }
     if let Some(e) = err {
         log!("config error, using defaults: {e}");
     }
@@ -323,6 +338,9 @@ pub fn main() {
         cleanup_raw();
         std::process::exit(1);
     }
+    // Shutdown already restored the desktop and detached callbacks. Avoid
+    // thread-local COM destruction racing detached WinRT workers at process exit.
+    std::process::exit(0);
 }
 
 fn install_panic_hook(path: PathBuf) {
@@ -369,6 +387,19 @@ fn cli_print(msg: &str) {
 fn run_command_line(dir: &std::path::Path) -> Option<i32> {
     let first = std::env::args().nth(1)?;
     match first.as_str() {
+        "--settings" if running_instance().is_some() => {
+            if let Some(h) = running_instance() {
+                unsafe {
+                    let _ = PostMessageW(Some(h), WM_SHELL_SETTINGS, WPARAM(0), LPARAM(0));
+                }
+            }
+            Some(0)
+        }
+        "--diagnose" => {
+            cli_print(&format!("WinShellTheme: {}", taskbar::diagnostics()));
+            log!("diagnostics: {}", taskbar::diagnostics());
+            Some(0)
+        }
         "--help" | "-h" | "/?" => {
             cli_print(USAGE);
             Some(0)
@@ -403,11 +434,17 @@ fn run_command_line(dir: &std::path::Path) -> Option<i32> {
                 cli_print("WinShellTheme is running; use --quit (it restores the taskbar itself).");
                 return Some(1);
             }
+            immersive::repair();
             let path = dir.join("taskbar_state.toml");
             let had_state = path.exists();
-            let _guard = TaskbarGuard::repair(path);
-            cli_print(if had_state { "Taskbar restored from the saved state." } else { "Nothing to restore." });
-            Some(0)
+            let _guard = TaskbarGuard::repair(path.clone());
+            if path.exists() || dir.join("immersive_state.toml").exists() {
+                cli_print("Desktop restoration is incomplete; recovery state kept. See winshell.log.");
+                Some(1)
+            } else {
+                cli_print(if had_state { "Taskbar restored from the saved state." } else { "Nothing to restore." });
+                Some(0)
+            }
         }
         "--enable-autostart" => {
             let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
@@ -544,6 +581,9 @@ fn run(mut opts: Options, config: Config, config_path: PathBuf, taskbar: Taskbar
     if !hotkey::register(top_bar.hwnd, HOTKEY_IMMERSIVE, VK_F) {
         log!("Ctrl+Shift+Alt+F unavailable; use the active window menu to restore immersive windows");
     }
+    if !hotkey::register(top_bar.hwnd, HOTKEY_CONTROLS, VK_SPACE) {
+        log!("desktop controls hotkey unavailable; use the dock gear or --settings");
+    }
     let dock = Popup::create(&gfx, WINDOW_CLASS, w!("WinShellTheme Dock"), bar_ex, opts.style)?;
     let tooltip = Popup::create(&gfx, WINDOW_CLASS, w!("WinShellTheme Tooltip"), bar_ex, opts.style)?;
     // The flyout takes focus so it can close when you click elsewhere (WA_INACTIVE) or press Esc.
@@ -646,14 +686,20 @@ fn run(mut opts: Options, config: Config, config_path: PathBuf, taskbar: Taskbar
     app.refresh_clock(); // the minute may have turned since clock_text was built
 
     // M5: only now that the dock can launch and switch apps.
-    if app.config.taskbar.autohide_native && !app.opts.keep_taskbar {
-        app.taskbar.enable_autohide();
+    if !app.opts.keep_taskbar {
+        app.taskbar.configure(app.config.taskbar.autohide_native, app.config.taskbar.hide_native);
         app.layout();
         app.redraw_all();
     }
     log!("ready; {}", MemSnapshot::now().describe());
 
+    let settings = app.opts.settings;
     APP.with(|a| *a.borrow_mut() = Some(app));
+    if settings {
+        unsafe {
+            let _ = PostMessageW(Some(top_hwnd), WM_SHELL_SETTINGS, WPARAM(0), LPARAM(0));
+        }
+    }
 
     unsafe {
         let mut msg = MSG::default();
@@ -691,10 +737,12 @@ impl App {
         // Overlays never reserve desktop space. Immersive apps use the monitor,
         // while the desktop rail stays clear of the native taskbar in --no-taskbar mode.
         let screen = self.monitor.monitor;
-        let work = win::work_area();
+        let work = if self.taskbar.is_suppressed() { screen } else { win::work_area() };
         let m = px(BAR_MARGIN, s);
+        let available = (screen.right - screen.left - 2 * m).max(1);
+        let width = if self.config.top_bar.compact { available.min(px(920.0, s)) } else { available };
         let bar =
-            win::rect(screen.left + m, screen.top + m, (screen.right - screen.left - 2 * m).max(1), px(BAR_HEIGHT, s));
+            win::rect(screen.left + (screen.right - screen.left - width) / 2, screen.top + m, width, px(BAR_HEIGHT, s));
         let margin = px(DOCK_MARGIN, s);
         self.dock_area = RECT {
             left: work.left.max(screen.left) + margin,
@@ -819,6 +867,7 @@ impl App {
         self.top_reserve.registered = false;
         self.bottom_reserve.registered = false;
         self.sync_reservations();
+        self.taskbar.enforce();
         self.rescan("Explorer restart");
         immersive::reflow();
         self.layout();
@@ -832,6 +881,7 @@ impl App {
         self.battery = power::battery();
         self.net_state = self.network.state();
         self.sysmon.refresh();
+        self.taskbar.enforce();
         self.rescan("resume");
         self.relayout_dock();
         self.redraw_all();
@@ -976,7 +1026,7 @@ impl App {
 
     fn apply_settings(&mut self, new: Config) {
         let pins_changed = new.dock.pinned_apps != self.config.dock.pinned_apps;
-        let autohide_changed = new.taskbar.autohide_native != self.config.taskbar.autohide_native;
+        let autohide_changed = new.taskbar != self.config.taskbar;
         if self.config.dock.immersive && !new.dock.immersive {
             immersive::restore_all();
             self.pending_launches.clear();
@@ -989,11 +1039,8 @@ impl App {
         self.sync_reservations();
         self.log_autohide();
         if autohide_changed && !self.opts.keep_taskbar {
-            if self.config.taskbar.autohide_native {
-                self.taskbar.enable_autohide();
-            } else {
-                self.taskbar.restore();
-            }
+            self.taskbar.restore();
+            self.taskbar.configure(self.config.taskbar.autohide_native, self.config.taskbar.hide_native);
         }
         self.apply_theme();
         self.layout();
@@ -1042,6 +1089,7 @@ impl App {
         self.bottom_reserve.remove();
         hotkey::unregister(self.top_bar.hwnd, hotkey::ID_EMERGENCY);
         hotkey::unregister(self.top_bar.hwnd, HOTKEY_IMMERSIVE);
+        hotkey::unregister(self.top_bar.hwnd, HOTKEY_CONTROLS);
         TOP_RESERVE_HWND.store(0, Ordering::SeqCst);
         BOTTOM_RESERVE_HWND.store(0, Ordering::SeqCst);
         for p in [&self.flyout, &self.tooltip, &self.dock, &self.top_bar] {
@@ -1251,12 +1299,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SHELL_RESTORE => {
             with_app_on_bar(hwnd, msg, wp, lp, |a| {
-                log!("second launch: showing the shell");
+                log!("second launch: showing desktop controls");
+                a.reveal_bar = true;
+                a.reveal_dock = true;
                 a.fullscreen = true;
                 a.set_fullscreen(false);
                 a.layout();
                 a.redraw_all();
+                a.open_panel(panel::PanelKind::Controls);
             });
+            LRESULT(0)
+        }
+        WM_SHELL_SETTINGS => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.open_panel(panel::PanelKind::Appearance));
+            LRESULT(0)
+        }
+        WM_HOTKEY if wp.0 as i32 == HOTKEY_CONTROLS => {
+            with_app_on_bar(hwnd, msg, wp, lp, |a| a.toggle_panel(panel::PanelKind::Controls));
             LRESULT(0)
         }
         WM_HOTKEY if wp.0 as i32 == HOTKEY_IMMERSIVE => {
@@ -1394,7 +1453,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 });
             } else if inactive {
                 with_app(hwnd, msg, wp, lp, |a| {
-                    if a.flyout.hwnd == hwnd {
+                    if a.flyout.hwnd == hwnd && !a.opts.preview {
                         a.close_panel();
                     }
                 });
@@ -1528,6 +1587,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DPICHANGED | WM_DISPLAYCHANGE => {
             with_app_on_bar(hwnd, msg, wp, lp, |a| {
                 if msg == WM_DISPLAYCHANGE {
+                    a.taskbar.enforce();
                     a.rescan("display change");
                 }
                 immersive::reflow();

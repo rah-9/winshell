@@ -13,9 +13,12 @@ pub struct Config {
     pub taskbar: Taskbar,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct General {
+    /// Keep desktop icons unobstructed until an edge is touched.
+    #[serde(default = "enabled")]
+    pub desktop_autohide: bool,
     /// Shown in the top bar's user pill. Empty = "@" + Windows user name.
     pub user_handle: String,
     /// "dark_glass", "light_clean", any file name in themes\ (without .toml), or "auto_system".
@@ -24,9 +27,17 @@ pub struct General {
     pub follow_windows_theme: bool,
 }
 
+impl Default for General {
+    fn default() -> Self {
+        Self { user_handle: String::new(), theme: String::new(), follow_windows_theme: false, desktop_autohide: true }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TopBar {
+    #[serde(default = "enabled")]
+    pub compact: bool,
     pub enabled_pills: Vec<String>,
     /// Hide when an app is maximised or overlaps the bar; push the mouse to the top
     /// edge to bring it back. Apps then get the full screen (no reserved space).
@@ -36,6 +47,7 @@ pub struct TopBar {
 impl Default for TopBar {
     fn default() -> Self {
         Self {
+            compact: true,
             enabled_pills: ["bluetooth", "wifi", "volume", "battery", "clock", "notifications", "quick_settings"]
                 .map(String::from)
                 .to_vec(),
@@ -73,13 +85,15 @@ impl Default for Dock {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Taskbar {
+    /// Hide native taskbar windows while the replacement shell runs.
+    pub hide_native: bool,
     /// Switch the native taskbar to autohide while running (restored on exit).
     pub autohide_native: bool,
 }
 
 impl Default for Taskbar {
     fn default() -> Self {
-        Self { autohide_native: true }
+        Self { autohide_native: true, hide_native: true }
     }
 }
 
@@ -91,8 +105,10 @@ pub const DEFAULT_CONFIG: &str = r#"# WinShellTheme configuration
 user_handle = ""                 # empty = "@" + your Windows user name
 theme = "midnight"               # "midnight", "pearl", "dark_glass", "light_clean", or "auto_system"
 follow_windows_theme = false     # true = follow Windows light/dark mode
+desktop_autohide = true          # reveal at top/left edge; keep desktop folders clear
 
 [top_bar]
+compact = true                  # centered floating bar instead of a full-width strip
 enabled_pills = ["bluetooth", "wifi", "volume", "battery", "clock", "notifications", "quick_settings"]
 autohide = true                  # hide over maximised apps; mouse to the top edge shows it
 
@@ -107,8 +123,13 @@ pinned_apps = [
 ]
 
 [taskbar]
+hide_native = true               # only show WinShellTheme; restored on exit
 autohide_native = true           # switch the native taskbar to autohide while running
 "#;
+
+fn enabled() -> bool {
+    true
+}
 
 pub fn parse(text: &str) -> Result<Config, String> {
     toml::from_str(text).map_err(|e| e.to_string())

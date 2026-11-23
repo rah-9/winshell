@@ -47,3 +47,8 @@ Validation so far: 64 tests passed, including native Win32 immersive restoration
 Stopped the release preview cleanly through --quit and verified no winshell process remains. Final cargo fmt --check, all 64 tests, and git diff --check passed. PLAN.md remains unchanged. Preparing the code/documentation commit for origin/main; untracked source_image references and the empty git file are excluded.
 
 Delivery checks: 64 tests passed; the application is stopped. Reference images remain local.
+
+### [2026-11-23 17:39 +05:30] - Development update
+**Topic**: Desktop replacement, clearance, and final delivery
+Implemented guarded hiding of native taskbars, atomic visibility/work-area recovery, event-driven suppression after Explorer/display changes, a compact centered bar, desktop edge reveal, a dock control panel, and appearance/behavior switches. Added --settings, --replace-taskbar, --diagnose, and Ctrl+Shift+Alt+Space. Work-area restoration preserves later changes by other desktop tools. Installer/uninstaller stop on failed desktop restoration. Terminal settings and PLAN.md remain unchanged.
+Validation: all 67 tests pass; release build and script parsing pass; Clippy passes with only the existing chunks_exact_to_as_chunks lint exempted. Live measurements confirmed full monitor work area during replacement and original taskbar visibility/margins after exit. Added explicit process termination after completed cleanup to avoid lingering COM/WinRT teardown. Final running shell was stopped; no taskbar recovery file remains. Computer-use access is revoked; subsequent shutdown and delivery use command-line tools only.

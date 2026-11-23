@@ -30,8 +30,8 @@ function Invoke-Winshell([string]$Argument) {
 
 if (Test-Path -LiteralPath $exe -PathType Leaf) {
     Write-Host 'Stopping WinShellTheme (it restores the taskbar)...'
-    [void](Invoke-Winshell '--quit')
-    [void](Invoke-Winshell '--restore-taskbar')
+    if ((Invoke-Winshell '--quit') -ne 0) { throw 'WinShellTheme could not exit safely; uninstall cancelled.' }
+    if ((Invoke-Winshell '--restore-taskbar') -ne 0) { throw 'Desktop restoration is incomplete; files kept for recovery.' }
     [void](Invoke-Winshell '--disable-autostart')
 } else {
     Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'WinShellTheme' -ErrorAction SilentlyContinue
@@ -44,8 +44,8 @@ if ((Test-Path -LiteralPath $dest -PathType Container) -and ((Split-Path -Leaf $
 }
 
 if ($RemoveSettings) {
-    if (Test-Path -LiteralPath (Join-Path $settings 'taskbar_state.toml')) {
-        Write-Warning 'taskbar_state.toml still exists: settings kept so the taskbar can be restored.'
+    if ((Test-Path -LiteralPath (Join-Path $settings 'taskbar_state.toml')) -or (Test-Path -LiteralPath (Join-Path $settings 'immersive_state.toml'))) {
+        Write-Warning 'Desktop recovery state still exists: settings kept so it can be restored.'
     } elseif ((Test-Path -LiteralPath $settings -PathType Container) -and ((Split-Path -Leaf $settings) -eq 'WinShellTheme')) {
         Remove-Item -LiteralPath $settings -Recurse -Force
         Write-Host "Removed $settings"
