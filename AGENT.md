@@ -6,25 +6,15 @@ This document contains operational instructions, architecture invariants, and co
 
 ## 1. Golden Rules for AI Agents
 
-1. **STRICT PRESERVATION OF `CHAT.md`**:
-   - **`CHAT.md` is strictly append-only.**
-   - **NEVER** overwrite, delete, truncate, or rewrite existing messages in [`CHAT.md`](CHAT.md).
-   - When communicating between agents (e.g. Assistant and Claude) or documenting session handoffs, always append a new entry to the bottom of [`CHAT.md`](CHAT.md) using the standard format:
-     ```markdown
-     ### [YYYY-MM-DD HH:MM TZ] - <Agent Name>
-     **Topic**: <Topic Title>
-     <Your message here>
-     ```
-
-2. **Non-Elevated / User-Mode Integrity**:
+1. **Non-Elevated / User-Mode Integrity**:
    - WinShellTheme must **never** require administrative privileges. The application manifest specifies `asInvoker`.
    - Do **not** introduce kernel drivers, API hooking (like MinHook/Detours), DLL injection, or undocumented system hacks that trip anti-cheat software or security tools.
 
-3. **Taskbar State Restoration Invariant**:
+2. **Taskbar State Restoration Invariant**:
    - The native taskbar's original state must **always** be protected.
    - Native taskbar visibility, work-area changes, and `ABS_AUTOHIDE` must be managed through [`src/taskbar.rs`](src/taskbar.rs) (`TaskbarGuard`) ensuring [`taskbar_state.toml`](src/taskbar_state.rs) is written *before* the modification and deleted only after a successful restore.
 
-4. **Zero-Polling / Event-Driven Architecture**:
+3. **Zero-Polling / Event-Driven Architecture**:
    - Never add periodic polling loops or busy-wait timers for system state.
    - Use Windows event mechanisms:
      - Foreground and window tracking: `SetWinEventHook` (out-of-context).
@@ -35,12 +25,12 @@ This document contains operational instructions, architecture invariants, and co
      - Configuration & Themes: `ReadDirectoryChangesW`.
    - Background threads communicate back to the UI thread via `PostMessageW(WM_SHELL_*)` with atomic debouncing/coalescing.
 
-5. **Memory & Performance Targets**:
+4. **Memory & Performance Targets**:
    - Target idle Private Working Set: $\le 30\text{--}32\text{ MB}$.
    - Idle CPU: 0%.
    - Keep GPU textures in check: the LRU icon cache in [`src/lru.rs`](src/lru.rs) has an 8 MB hard budget.
 
-6. **Safety & Input Sanitization**:
+5. **Safety & Input Sanitization**:
    - AUMIDs from foreign processes must pass [`is_safe_aumid()`](src/util.rs) before reaching shell namespace APIs to prevent directory traversal or URI spoofing.
    - DLL loading is hardened via [`src/hardening.rs`](src/hardening.rs).
 
@@ -53,9 +43,7 @@ F:\theme\
 ├── Cargo.toml               # Package manifest (Rust 2024 edition)
 ├── build.rs                 # Compiles winshell.manifest and resources
 ├── README.md                # Public project documentation
-├── CHAT.md                  # Collaborative chat log between AI agents (APPEND-ONLY)
 ├── AGENT.md                 # This file (Agent instructions & guidelines)
-├── PLAN.md                  # Detailed design specification
 ├── resources/               # Manifest, app icon, resource script
 ├── scripts/                 # PowerShell installation and uninstallation scripts
 └── src/
@@ -117,8 +105,8 @@ F:\theme\
 - **Formatting & Linting**:
   Follow `rustfmt.toml` and standard Rust idioms. Avoid unnecessary dependencies.
 
-- **Cross-Agent Communication**:
-  Whenever you make a significant change, fix a bug, or pause a multi-step task, post an entry in [`CHAT.md`](CHAT.md) so the next agent (or the user) has full visibility into what was done and what remains.
+- **Change Documentation**:
+  Describe significant behavior changes and validation in commit messages, and keep the README aligned with the implementation.
 
 ## Current layout and immersive behavior
 
@@ -126,7 +114,7 @@ F:\theme\
 - Preserve thin geometry, overflow access, DPI scaling, and side-anchored tooltips / pickers.
 - Immersive changes apply only to selected or dock-launched eligible windows. Save the original style and placement before mutation; restore on toggle, exit, panic, or next launch after termination. Keep fixed-size dialogs and elevated targets unchanged.
 - Keep full-screen recovery in `src/shell/immersive.rs`. Never simulate a universal F11 command.
-- `PLAN.md` remains historical and unchanged by this redesign. README and source describe current behavior.
+- The README and source describe current behavior. This is a pilot project open to collaboration.
 
 ## Native-taskbar replacement and desktop clearance
 

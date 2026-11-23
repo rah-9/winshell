@@ -6,6 +6,12 @@ WinShellTheme delivers a compact translucent top bar, a thin vertical left dock,
 
 `explorer.exe` continues running in the background; WinShellTheme requires **no administrator privileges**, uses no kernel hooks or DLL injection, and hides the native Windows taskbars while running, with saved visibility, work areas, and recovery on the next launch after a forced exit.
 
+## Pilot Project & Collaboration
+
+WinShellTheme is a **pilot project**, open to contributions and collaboration. The goal is to refresh the traditional Windows desktop with a modern, interactive experience built in **Rust**, with a focus on memory efficiency and low resource usage.
+
+Developers, designers, and testers are welcome to help improve the interface, features, performance, and reliability. If you would like to collaborate, contact **Rahul** at [rahul.dev.xai@gmail.com](mailto:rahul.dev.xai@gmail.com).
+
 ---
 
 ## Highlights & Features
@@ -280,6 +286,6 @@ Build the diagnostic spike separately with `cargo build --release --features spi
 
 Immersive mode uses documented borderless-window APIs, not an application's F11 command. Apps that draw their own title bars may retain those controls. A forced process kill is repaired on the next shell launch. No watchdog process runs. Taskbar recovery now includes visibility and per-monitor work areas. Work-area restoration applies only on matching displays when the current geometry is still the value applied by this shell, preserving later changes by other tools.
 
-`PLAN.md` is the historical design document and intentionally remains unchanged. Current behavior and settings are described here and in the source.
+Current behavior and settings are described in this README and the source code.
 
 Replacement mode uses documented window and work-area APIs; see [Microsoft work-area documentation](https://learn.microsoft.com/en-us/windows/win32/gdi/multiple-monitor-system-metrics). It does not replace Explorer, install a service, or modify Terminal settings. Terminal customization is a separate stage.
