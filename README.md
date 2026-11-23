@@ -1,6 +1,6 @@
 # WinShellTheme
 
-A high-performance, lightweight, and fully customizable desktop shell overlay for **Windows 11 (22H2+)**, crafted in Rust.
+An experimental desktop customization app for **Windows 11 (22H2+)**, built in Rust with a focus on memory efficiency and interactive controls.
 
 WinShellTheme delivers a compact translucent top bar, a thin vertical left dock, and interactive flyout panels rendered with **Direct2D**, **DirectWrite**, and **DirectComposition** over native **Desktop Window Manager (DWM)** backdrops (Acrylic & Mica).
 
@@ -11,6 +11,11 @@ WinShellTheme delivers a compact translucent top bar, a thin vertical left dock,
 WinShellTheme is a **pilot project**, open to contributions and collaboration. The goal is to refresh the traditional Windows desktop with a modern, interactive experience built in **Rust**, with a focus on memory efficiency and low resource usage.
 
 Developers, designers, and testers are welcome to help improve the interface, features, performance, and reliability. If you would like to collaborate, contact **Rahul** at [rahul.dev.xai@gmail.com](mailto:rahul.dev.xai@gmail.com).
+
+**Status: early pilot, actively under development.** Taskbar hiding, multiple screens, panel placement, button/scroll behavior, and app fitting remain open work. Some Wi-Fi/Bluetooth actions currently open native Windows settings or pickers. Phone integration and Terminal customization are later stages.
+
+Start with the [contribution guide](CONTRIBUTING.md) and [prioritized roadmap](ROADMAP.md), or [report a bug](https://github.com/rah-9/winshell/issues/new?template=bug_report.yml). Contributions can be small: a reliable reproduction, a test report, a UX improvement, or a focused fix.
+
 
 ---
 

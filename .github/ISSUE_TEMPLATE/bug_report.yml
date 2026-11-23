@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible shell, layout, interaction, or device problem.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: "This is an early pilot. A focused reproduction helps contributors investigate. Do not include unrelated private information."
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Native taskbar or desktop recovery
+        - Multi-monitor or display scaling
+        - Panel placement or screen fitting
+        - Buttons, keyboard, or scrolling
+        - App launch, grouping, or immersive windows
+        - Wi-Fi or Bluetooth
+        - Phone or connected device
+        - Audio or media
+        - Themes, performance, or another area
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: "Include the affected panel/button and whether this happens every time."
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: "Commit/version, Windows build, preview or normal mode, monitor count, resolutions, scaling, primary display, and affected app/device versions."
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and recovery result
+      description: "Relevant diagnostic lines, cropped images, and whether exiting restored the desktop. For device reports, specify USB, Bluetooth, or Phone Link."

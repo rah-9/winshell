@@ -1,0 +1,30 @@
+name: Improvement proposal
+description: Propose a focused improvement to the pilot.
+title: "[Improvement]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem should this solve?
+      description: "Describe the user action or workflow, not just a visual preference."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: "Explain placement, interaction, display/device conditions, and any Windows-settings handoff."
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: How would we verify it works?
+      description: "Suggest testable acceptance criteria and a roadmap ID if relevant."
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope, alternatives, and contribution
+      description: "Mention dependencies, system changes, alternatives, and whether you can help with implementation, design, or testing."
